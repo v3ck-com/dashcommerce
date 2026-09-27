@@ -53,12 +53,11 @@ export interface RefundOrderInput {
 	idempotencyKey: string;
 }
 
-export async function refundOrder(
-	ctx: PluginContext,
-	input: RefundOrderInput,
-): Promise<Refund> {
+export async function refundOrder(ctx: PluginContext, input: RefundOrderInput): Promise<Refund> {
 	const order = await loadOrder(ctx, input.orderId);
 	if (!order) throw new Error(`Order ${input.orderId} not found`);
+	if (order.paymentProvider === "paystack-test")
+		throw new Error("Paystack test refunds are disabled; no Stripe refund was attempted");
 
 	if (order.currency !== input.amount.currency) {
 		throw new CurrencyMismatchError(order.currency, input.amount.currency);
@@ -68,9 +67,7 @@ export async function refundOrder(
 	}
 	const remaining = order.paidTotal.amount - order.refundedTotal.amount;
 	if (input.amount.amount > remaining) {
-		throw new Error(
-			`Refund ${input.amount.amount} exceeds remaining refundable ${remaining}`,
-		);
+		throw new Error(`Refund ${input.amount.amount} exceeds remaining refundable ${remaining}`);
 	}
 
 	// Stripe call first — if this fails, we don't write anything.
@@ -124,10 +121,7 @@ export async function refundOrder(
 
 	// Update order totals + status.
 	const newRefundedTotal = add(order.refundedTotal, input.amount);
-	const paymentStatus = derivePaymentStatus(
-		order.paidTotal.amount,
-		newRefundedTotal.amount,
-	);
+	const paymentStatus = derivePaymentStatus(order.paidTotal.amount, newRefundedTotal.amount);
 	const status = deriveOrderStatusFromRefunds(
 		order.status,
 		order.paidTotal.amount,
@@ -162,7 +156,7 @@ async function stripeRefundWithDedup(
 	return createRefund(
 		ctx,
 		{
-			paymentIntent: order.stripePaymentIntentId,
+			paymentIntent: order.stripePaymentIntentId!,
 			amount: input.amount.amount,
 			reason:
 				input.reason === "fraudulent" ||
@@ -197,7 +191,10 @@ export async function recordRefundFromWebhook(
 		return { ...(prev.data as Refund), id: prev.id };
 	}
 
-	const amount: Money = { currency: stripeRefund.currency.toUpperCase(), amount: stripeRefund.amount };
+	const amount: Money = {
+		currency: stripeRefund.currency.toUpperCase(),
+		amount: stripeRefund.amount,
+	};
 	if (amount.currency !== order.currency) {
 		ctx.log.error("Refund currency mismatch with order", {
 			refundId: stripeRefund.id,
@@ -226,10 +223,7 @@ export async function recordRefundFromWebhook(
 	await refundsStore(ctx).put(refundId, refund);
 
 	const newRefundedTotal = add(order.refundedTotal, amount);
-	const paymentStatus = derivePaymentStatus(
-		order.paidTotal.amount,
-		newRefundedTotal.amount,
-	);
+	const paymentStatus = derivePaymentStatus(order.paidTotal.amount, newRefundedTotal.amount);
 	const status = deriveOrderStatusFromRefunds(
 		order.status,
 		order.paidTotal.amount,

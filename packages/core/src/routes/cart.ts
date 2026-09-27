@@ -2,7 +2,7 @@
  * Cart routes — all public.
  *
  *   GET    /cart                         — current cart (creates if missing)
- *   POST   /cart/items                   — add line item { productId, variantId?, quantity }
+ *   POST   /cart/items                   — add line item { productId, variantId?, quantity, customisation? }
  *   PATCH  /cart/item?lineId={id}        — update qty
  *   DELETE /cart/item?lineId={id}        — remove
  *   POST   /cart/coupon                  — apply { code }
@@ -30,6 +30,7 @@
 
 import type { PluginContext, RouteContext } from "emdash";
 import { randomId } from "../util/ids";
+import { isObject, validAddress, validContactInput } from "../cart/validation";
 import { getCart, getOrCreate, save, switchCurrency } from "../cart/store";
 import { recalculate, type PricingPolicy } from "../cart/calculate";
 import { verifyRestoreToken } from "../abandoned-cart/recover";
@@ -46,6 +47,13 @@ import type {
 } from "../types";
 import { resolvePrice } from "../products/pricing";
 import { normalizeProductFields } from "../products/normalize";
+import {
+	CUSTOMISATION_FIELD_SLUG,
+	customisationIdentity,
+	validateCustomisation,
+} from "../cart/customisation";
+import { MAX_INVENTORY_QUANTITY } from "../inventory/reservations";
+import { getVariant, listVariantsForProduct } from "../products/variants";
 
 // Cart routes must return HTTP 4xx on failure — returning a plain
 // `{ error }` object gets serialized as `{ status: 200, body: { error } }`
@@ -65,10 +73,7 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
 }
 
 /** Attach Set-Cookie when `resolveSessionId` minted a new id (no cookie on the request). */
-function withSessionCookie(
-	setCookie: string | undefined,
-	init: ResponseInit = {},
-): ResponseInit {
+function withSessionCookie(setCookie: string | undefined, init: ResponseInit = {}): ResponseInit {
 	if (!setCookie) return init;
 	return {
 		...init,
@@ -116,6 +121,27 @@ async function defaultCurrency(ctx: PluginContext): Promise<CurrencyCode> {
 	return (await ctx.kv.get<CurrencyCode>("settings:defaultCurrency")) ?? "USD";
 }
 
+/** Reject forged/inactive variants and parent lines for products with variants. */
+async function validateVariantSelection(
+	ctx: PluginContext,
+	productId: string,
+	variantId: string | undefined,
+): Promise<string | null> {
+	if (variantId) {
+		const variant = await getVariant(ctx, variantId);
+		if (!variant || variant.productId !== productId || variant.isActive !== true) {
+			return "Variant not found or unavailable";
+		}
+		return null;
+	}
+	// The collection is always present in an installed plugin. Keeping this
+	// guard lets minimal non-inventory route stubs represent a simple product.
+	if (!(ctx.storage as unknown as { product_variants?: unknown }).product_variants) return null;
+	const variants = await listVariantsForProduct(ctx, productId, { limit: 100 });
+	if (variants.hasMore) return "Product variants cannot be safely resolved";
+	return variants.items.length > 0 ? "Select a product variant" : null;
+}
+
 /**
  * Load a product from the host content collection by ULID or slug.
  *
@@ -138,9 +164,7 @@ async function loadProduct(ctx: PluginContext, idOrSlug: string) {
 		// catalogues should be passing the ULID (the UI already has it
 		// from the entry envelope).
 		const list = await content.list("products", { limit: 200 });
-		const hit = list.items.find(
-			(r) => r.slug === idOrSlug || r.id === idOrSlug,
-		);
+		const hit = list.items.find((r) => r.slug === idOrSlug || r.id === idOrSlug);
 		record = hit ?? null;
 	}
 	if (!record || record.status !== "published") return null;
@@ -177,9 +201,34 @@ export const cartRoutes = {
 				productId?: string;
 				variantId?: string;
 				quantity?: number;
-			};
-			if (!body.productId) return errorResponse("productId required", 400);
-			const qty = Math.max(1, Math.floor(body.quantity ?? 1));
+				customisation?: unknown;
+			} | null;
+			if (
+				!body ||
+				typeof body !== "object" ||
+				Array.isArray(body) ||
+				Object.keys(body).some(
+					(key) => !["productId", "variantId", "quantity", "customisation"].includes(key),
+				)
+			) {
+				return errorResponse("Invalid cart item fields", 400);
+			}
+			if (typeof body.productId !== "string" || !body.productId)
+				return errorResponse("productId required", 400);
+			if (body.variantId !== undefined && (typeof body.variantId !== "string" || !body.variantId))
+				return errorResponse("Invalid variantId", 400);
+			if (
+				body.quantity !== undefined &&
+				(!Number.isSafeInteger(body.quantity) ||
+					body.quantity < 1 ||
+					body.quantity > MAX_INVENTORY_QUANTITY)
+			) {
+				return errorResponse(
+					`Quantity must be a safe integer between 1 and ${MAX_INVENTORY_QUANTITY}`,
+					400,
+				);
+			}
+			const qty = body.quantity ?? 1;
 
 			const { sessionId, setCookie } = resolveSessionId(routeCtx.request);
 			const cart = await getOrCreate(ctx, sessionId, await defaultCurrency(ctx));
@@ -188,21 +237,18 @@ export const cartRoutes = {
 			if (!product) {
 				return errorResponse("Product not found or unavailable", 404, setCookie);
 			}
+			const variantError = await validateVariantSelection(ctx, body.productId, body.variantId);
+			if (variantError) return errorResponse(variantError, 409, setCookie);
 
 			// emdash stores commerce fields under their snake_case slugs.
 			// Normalize into our camelCase ProductFields shape before any
 			// downstream read.
-			const fields = normalizeProductFields(
-				product.data as Record<string, unknown>,
-			);
+			const fields = normalizeProductFields(product.data as Record<string, unknown>);
 			const priced = resolvePrice({ product: fields, currency: cart.currency });
 			if (!priced) {
 				const available = Object.keys(fields.prices ?? {});
-				const enabled =
-					(await ctx.kv.get<string[]>("settings:enabledCurrencies")) ?? [];
-				const switchable = available.filter(
-					(c) => enabled.length === 0 || enabled.includes(c),
-				);
+				const enabled = (await ctx.kv.get<string[]>("settings:enabledCurrencies")) ?? [];
+				const switchable = available.filter((c) => enabled.length === 0 || enabled.includes(c));
 				const hint =
 					switchable.length > 0
 						? `Try switching the storefront currency to ${switchable.join(", ")}.`
@@ -219,20 +265,37 @@ export const cartRoutes = {
 				);
 			}
 
-			// Merge with existing line if same product+variant combination
+			const customisation = validateCustomisation(
+				(product.data as Record<string, unknown>)[CUSTOMISATION_FIELD_SLUG],
+				body.customisation,
+			);
+			if (!customisation.ok) return errorResponse(customisation.error, 400, setCookie);
+
+			// Merge only lines with the same product, variant AND canonical options.
 			const existing = cart.items.find(
-				(i) => i.productId === body.productId && i.variantId === body.variantId,
+				(i) =>
+					i.productId === body.productId &&
+					i.variantId === body.variantId &&
+					customisationIdentity(i.customisation) === customisation.identity,
 			);
 			let items: CartLineItem[];
 			if (existing) {
+				const nextQuantity = existing.quantity + qty;
+				if (!Number.isSafeInteger(nextQuantity) || nextQuantity > MAX_INVENTORY_QUANTITY) {
+					return errorResponse(
+						`Quantity must be a safe integer between 1 and ${MAX_INVENTORY_QUANTITY}`,
+						400,
+						setCookie,
+					);
+				}
 				items = cart.items.map((i) =>
 					i === existing
 						? {
 								...i,
-								quantity: i.quantity + qty,
+								quantity: nextQuantity,
 								lineSubtotal: {
 									currency: i.unitPrice.currency,
-									amount: i.unitPrice.amount * (i.quantity + qty),
+									amount: i.unitPrice.amount * nextQuantity,
 								},
 							}
 						: i,
@@ -244,6 +307,7 @@ export const cartRoutes = {
 					productId: body.productId,
 					...(body.variantId ? { variantId: body.variantId } : {}),
 					quantity: qty,
+					...(customisation.options ? { customisation: customisation.options } : {}),
 					unitPrice: priced.unit,
 					lineSubtotal: {
 						currency: priced.unit.currency,
@@ -252,9 +316,7 @@ export const cartRoutes = {
 					title: fields.title,
 					isDigital: fields.isVirtual || fields.isDownloadable,
 					...(fields.vendorId ? { vendorId: fields.vendorId } : {}),
-					...(fields.subscriptionConfig
-						? { subscriptionConfig: fields.subscriptionConfig }
-						: {}),
+					...(fields.subscriptionConfig ? { subscriptionConfig: fields.subscriptionConfig } : {}),
 					...(fields.shippingClassSlug !== null
 						? { shippingClassSlug: fields.shippingClassSlug }
 						: {}),
@@ -294,10 +356,7 @@ export const cartRoutes = {
 				coupons: [],
 				shippingMethod: undefined,
 			};
-			const saved = await save(
-				ctx,
-				recalculate(emptied, await readPricingPolicy(ctx)),
-			);
+			const saved = await save(ctx, recalculate(emptied, await readPricingPolicy(ctx)));
 			return jsonResponse({ cart: saved }, withSessionCookie(setCookie));
 		},
 	},
@@ -313,10 +372,7 @@ export const cartRoutes = {
 			// operator has explicitly enabled in settings.
 			const enabled = (await ctx.kv.get<string[]>("settings:enabledCurrencies")) ?? [];
 			if (enabled.length > 0 && !enabled.includes(code)) {
-				return errorResponse(
-					`Currency ${code} is not enabled for this store`,
-					400,
-				);
+				return errorResponse(`Currency ${code} is not enabled for this store`, 400);
 			}
 
 			const { sessionId, setCookie } = resolveSessionId(routeCtx.request);
@@ -339,7 +395,12 @@ export const cartRoutes = {
 		public: true,
 		handler: async (routeCtx: RouteContext, ctx: PluginContext) => {
 			const body = routeCtx.input as { address?: CartState["shippingAddress"] };
-			if (!body.address) return errorResponse("address required", 400);
+			if (
+				!isObject(body) ||
+				Object.keys(body).some((k) => k !== "address") ||
+				!validAddress(body.address)
+			)
+				return errorResponse("Valid full address required", 400);
 			const { sessionId, setCookie } = resolveSessionId(routeCtx.request);
 			const cart = await getOrCreate(ctx, sessionId, await defaultCurrency(ctx));
 			const updated = recalculate(
@@ -366,6 +427,7 @@ export const cartRoutes = {
 				shippingAddress?: CartState["shippingAddress"];
 				notes?: string;
 			};
+			if (!validContactInput(body)) return errorResponse("Invalid contact fields", 400);
 			const { sessionId, setCookie } = resolveSessionId(routeCtx.request);
 			const cart = await getOrCreate(ctx, sessionId, await defaultCurrency(ctx));
 			const next: CartState = { ...cart };
@@ -401,11 +463,7 @@ export const cartRoutes = {
 			const itemsIdx = parts.lastIndexOf("items");
 			const itemIdx = parts.lastIndexOf("item");
 			const pathLineId =
-				itemIdx !== -1
-					? parts[itemIdx + 1]
-					: itemsIdx !== -1
-						? parts[itemsIdx + 1]
-						: undefined;
+				itemIdx !== -1 ? parts[itemIdx + 1] : itemsIdx !== -1 ? parts[itemsIdx + 1] : undefined;
 			const lineId = qsLineId ?? pathLineId;
 			if (!lineId) return errorResponse("lineId required", 400);
 
@@ -417,8 +475,21 @@ export const cartRoutes = {
 			if (method === "DELETE") {
 				items = cart.items.filter((i) => i.lineId !== lineId);
 			} else {
-				const body = routeCtx.input as { quantity?: number };
-				const qty = Math.max(0, Math.floor(body.quantity ?? 0));
+				const body = routeCtx.input as { quantity?: unknown };
+				if (
+					body.quantity !== undefined &&
+					(typeof body.quantity !== "number" ||
+						!Number.isSafeInteger(body.quantity) ||
+						body.quantity < 0 ||
+						body.quantity > MAX_INVENTORY_QUANTITY)
+				) {
+					return errorResponse(
+						`Quantity must be a safe integer between 0 and ${MAX_INVENTORY_QUANTITY}`,
+						400,
+						setCookie,
+					);
+				}
+				const qty = (body.quantity as number | undefined) ?? 0;
 				if (qty === 0) {
 					items = cart.items.filter((i) => i.lineId !== lineId);
 				} else {
@@ -463,7 +534,11 @@ export const cartRoutes = {
 
 			const couponsStore = (
 				ctx.storage as unknown as {
-					coupons: { query(opts: { where: Record<string, string>; limit: number }): Promise<{ items: Array<{ id: string; data: Coupon }> }> };
+					coupons: {
+						query(opts: { where: Record<string, string>; limit: number }): Promise<{
+							items: Array<{ id: string; data: Coupon }>;
+						}>;
+					};
 				}
 			).coupons;
 			const result = await couponsStore.query({
@@ -483,10 +558,7 @@ export const cartRoutes = {
 				const applied = resolveDiscount(coupon, cart);
 				const nextCart: CartState = {
 					...cart,
-					coupons: [
-						...cart.coupons.filter((c) => c.code !== applied.code),
-						applied,
-					],
+					coupons: [...cart.coupons.filter((c) => c.code !== applied.code), applied],
 				};
 				const updated = recalculate(nextCart, await readPricingPolicy(ctx));
 				const saved = await save(ctx, updated);
@@ -525,9 +597,7 @@ export const cartRoutes = {
 			const cart = await getOrCreate(ctx, sessionId, await defaultCurrency(ctx));
 			const nextCart: CartState = {
 				...cart,
-				coupons: cart.coupons.filter(
-					(c) => c.code.toUpperCase() !== code.toUpperCase(),
-				),
+				coupons: cart.coupons.filter((c) => c.code.toUpperCase() !== code.toUpperCase()),
 			};
 			const updated = recalculate(nextCart, await readPricingPolicy(ctx));
 			const saved = await save(ctx, updated);
@@ -555,9 +625,17 @@ export const cartRoutes = {
 				country?: string;
 				postalCode?: string;
 			};
-			const country = body.country?.trim().toUpperCase();
-			const postalCode = body.postalCode?.trim();
-			if (!country || country.length !== 2) {
+			if (
+				!isObject(body) ||
+				Object.keys(body).some((k) => !["country", "postalCode"].includes(k)) ||
+				typeof body.country !== "string" ||
+				typeof body.postalCode !== "string" ||
+				body.postalCode.length > 200
+			)
+				return errorResponse("Invalid shipping location", 400);
+			const country = body.country.trim().toUpperCase();
+			const postalCode = body.postalCode.trim();
+			if (!/^[A-Z]{2}$/.test(country)) {
 				return errorResponse("country (ISO-2) required", 400);
 			}
 			if (!postalCode) {
@@ -612,29 +690,31 @@ export const cartRoutes = {
 					};
 				}
 			).shipping_zones;
-		const methodsStore = (
-			ctx.storage as unknown as {
-				shipping_methods: {
-					query(opts: {
-						where?: Record<string, string | number>;
-						limit: number;
-					}): Promise<{ items: Array<{ id: string; data: ShippingMethod }> }>;
-				};
-			}
-		).shipping_methods;
+			const methodsStore = (
+				ctx.storage as unknown as {
+					shipping_methods: {
+						query(opts: {
+							where?: Record<string, string | number>;
+							limit: number;
+						}): Promise<{ items: Array<{ id: string; data: ShippingMethod }> }>;
+					};
+				}
+			).shipping_methods;
 
-		const zones = (await zonesStore.query({ limit: 200 })).items.map((r) => ({
-			...r.data,
-			id: r.id,
-		}));
-		const zone = pickZone(cart.shippingAddress, zones);
-		if (!zone) return jsonResponse({ options: [] }, withSessionCookie(setCookie));
-		// Fetch all methods and filter in JS — EmDash's .where builds SQLite-style
-		// SQL that breaks on Postgres (syntax error near "="). This fetch+filter
-		// approach works across both databases.
-		const methods = (await methodsStore.query({ limit: 200 })).items
-			.map((r) => ({ ...r.data, id: r.id }))
-			.filter((m) => m.zoneId === zone.id && (m.enabled === true || (m.enabled as unknown) === 1));
+			const zones = (await zonesStore.query({ limit: 200 })).items.map((r) => ({
+				...r.data,
+				id: r.id,
+			}));
+			const zone = pickZone(cart.shippingAddress, zones);
+			if (!zone) return jsonResponse({ options: [] }, withSessionCookie(setCookie));
+			// Fetch all methods and filter in JS — EmDash's .where builds SQLite-style
+			// SQL that breaks on Postgres (syntax error near "="). This fetch+filter
+			// approach works across both databases.
+			const methods = (await methodsStore.query({ limit: 200 })).items
+				.map((r) => ({ ...r.data, id: r.id }))
+				.filter(
+					(m) => m.zoneId === zone.id && (m.enabled === true || (m.enabled as unknown) === 1),
+				);
 
 			const options = calculateRates({
 				items: cart.items,
@@ -654,7 +734,13 @@ export const cartRoutes = {
 		handler: async (routeCtx: RouteContext, _ctx?: PluginContext) => {
 			const ctx = (_ctx ?? (routeCtx as unknown as PluginContext)) as PluginContext;
 			const body = routeCtx.input as { methodId?: string };
-			if (!body.methodId) return errorResponse("methodId required", 400);
+			if (
+				!isObject(body) ||
+				Object.keys(body).some((k) => k !== "methodId") ||
+				typeof body.methodId !== "string" ||
+				!/^[A-Za-z0-9_-]{1,128}$/.test(body.methodId)
+			)
+				return errorResponse("methodId required", 400);
 			const { sessionId, setCookie } = resolveSessionId(routeCtx.request);
 			const cart = await getOrCreate(ctx, sessionId, await defaultCurrency(ctx));
 			if (!cart.shippingAddress) {
@@ -669,31 +755,33 @@ export const cartRoutes = {
 					};
 				}
 			).shipping_zones;
-		const methodsStore = (
-			ctx.storage as unknown as {
-				shipping_methods: {
-					get(id: string): Promise<ShippingMethod | null>;
-					query(opts: {
-						where?: Record<string, string | number>;
-						limit: number;
-					}): Promise<{ items: Array<{ id: string; data: ShippingMethod }> }>;
-				};
+			const methodsStore = (
+				ctx.storage as unknown as {
+					shipping_methods: {
+						get(id: string): Promise<ShippingMethod | null>;
+						query(opts: {
+							where?: Record<string, string | number>;
+							limit: number;
+						}): Promise<{ items: Array<{ id: string; data: ShippingMethod }> }>;
+					};
+				}
+			).shipping_methods;
+			const zones = (await zonesStore.query({ limit: 200 })).items.map((r) => ({
+				...r.data,
+				id: r.id,
+			}));
+			const zone = pickZone(cart.shippingAddress, zones);
+			if (!zone) {
+				return errorResponse("No shipping zone matches the address", 409, setCookie);
 			}
-		).shipping_methods;
-		const zones = (await zonesStore.query({ limit: 200 })).items.map((r) => ({
-			...r.data,
-			id: r.id,
-		}));
-		const zone = pickZone(cart.shippingAddress, zones);
-		if (!zone) {
-			return errorResponse("No shipping zone matches the address", 409, setCookie);
-		}
-		// Fetch all methods and filter in JS — EmDash's .where builds SQLite-style
-		// SQL that breaks on Postgres (syntax error near "="). This fetch+filter
-		// approach works across both databases.
-		const methods = (await methodsStore.query({ limit: 200 })).items
-			.map((r) => ({ ...r.data, id: r.id }))
-			.filter((m) => m.zoneId === zone.id && (m.enabled === true || (m.enabled as unknown) === 1));
+			// Fetch all methods and filter in JS — EmDash's .where builds SQLite-style
+			// SQL that breaks on Postgres (syntax error near "="). This fetch+filter
+			// approach works across both databases.
+			const methods = (await methodsStore.query({ limit: 200 })).items
+				.map((r) => ({ ...r.data, id: r.id }))
+				.filter(
+					(m) => m.zoneId === zone.id && (m.enabled === true || (m.enabled as unknown) === 1),
+				);
 			const options = calculateRates({
 				items: cart.items,
 				currency: cart.currency,
@@ -742,10 +830,10 @@ export const cartRoutes = {
 			}
 			const verified = await verifyRestoreToken(ctx, token);
 			if (!verified.ok || !verified.sessionId) {
-				return new Response(
-					JSON.stringify({ error: `Invalid token: ${verified.reason}` }),
-					{ status: 401, headers: { "Content-Type": "application/json" } },
-				);
+				return new Response(JSON.stringify({ error: `Invalid token: ${verified.reason}` }), {
+					status: 401,
+					headers: { "Content-Type": "application/json" },
+				});
 			}
 			const cart = await getCart(ctx, verified.sessionId);
 			if (!cart) {

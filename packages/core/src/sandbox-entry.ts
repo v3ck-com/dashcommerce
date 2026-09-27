@@ -20,13 +20,13 @@
  * `ctx.input`) and the plugin surface (`ctx.storage`, `ctx.kv`, `ctx.http`…).
  * DashCommerce's route handlers are authored two-arg `(routeCtx, ctx)`; we
  * adapt them to the single-arg form below (passing the one context as both).
- * We deliberately do NOT use `adaptSandboxEntry` here: it flattens
- * `routeCtx.request` to `{ url, method, headers }` with no body, which would
- * break the Stripe webhook's raw-body signature verification.
+ * Webhooks use EmDash 0.41's declared bytes input, rather than rereading
+ * the guarded request stream. Request contracts must survive adaptation.
  */
 
 import {
 	definePlugin,
+	pluginResponse,
 	type FieldWidgetConfig,
 	type PluginAdminConfig,
 	type PluginAdminPage,
@@ -62,7 +62,7 @@ const DEFAULT_CAPABILITIES: PluginCapability[] = [
 	"network:request",
 	"email:send",
 ];
-const DEFAULT_ALLOWED_HOSTS = ["api.stripe.com", "files.stripe.com"];
+const DEFAULT_ALLOWED_HOSTS = ["api.stripe.com", "files.stripe.com", "api.paystack.co"];
 
 /**
  * DashCommerce's route handlers are authored in the two-arg convention
@@ -74,6 +74,8 @@ const DEFAULT_ALLOWED_HOSTS = ["api.stripe.com", "files.stripe.com"];
 type CommerceRouteEntry = {
 	public?: boolean;
 	input?: PluginRoute["input"];
+	request?: PluginRoute["request"];
+	methods?: PluginRoute["methods"];
 	handler: (routeCtx: RouteContext, ctx: PluginContext) => Promise<unknown>;
 };
 
@@ -102,15 +104,44 @@ const ROUTES = {
  * `PluginRoute` form. `RouteContext` extends `PluginContext`, so the one
  * `ctx` is passed as both arguments. `public` and `input` pass through.
  */
-function toNativeRoutes(
-	routes: Record<string, CommerceRouteEntry>,
-): Record<string, PluginRoute> {
+async function toPluginResponse(value: unknown): Promise<unknown> {
+	if (!(value instanceof Response)) {
+		return pluginResponse({
+			headers: { "content-type": "application/json; charset=utf-8" },
+			body: { kind: "text", value: JSON.stringify({ success: true, data: value }) },
+		});
+	}
+	const body =
+		value.body === null
+			? null
+			: { kind: "bytes" as const, value: new Uint8Array(await value.arrayBuffer()) };
+	return pluginResponse({ status: value.status, headers: value.headers, body });
+}
+
+const JSON_POST_ROUTES = new Set([
+	"cart/items",
+	"cart/contact",
+	"cart/coupon",
+	"cart/currency",
+	"cart/shipping-location",
+	"cart/shipping-address",
+	"cart/shipping-method",
+	"checkout/create-intent",
+	"checkout/create-session",
+]);
+
+function toNativeRoutes(routes: Record<string, CommerceRouteEntry>): Record<string, PluginRoute> {
 	const out: Record<string, PluginRoute> = {};
 	for (const [name, route] of Object.entries(routes)) {
 		out[name] = {
 			public: route.public,
 			input: route.input,
-			handler: (ctx) => route.handler(ctx, ctx),
+			request:
+				route.request ??
+				(JSON_POST_ROUTES.has(name) ? { body: "json", maxBytes: 32768 } : undefined),
+			methods: route.methods ?? (JSON_POST_ROUTES.has(name) ? ["POST"] : undefined),
+			response: "raw",
+			handler: async (ctx) => toPluginResponse(await route.handler(ctx, ctx)),
 		};
 	}
 	return out;
@@ -216,7 +247,7 @@ export function createPlugin(options: CreatePluginOptions = {}) {
 	// Validate EmDash version compatibility before initializing the plugin
 	// The version is detected at build time in the descriptor and passed here
 	validateEmDashCompatibility(options.emdashVersion);
-	
+
 	return definePlugin({
 		id: options.id ?? "dashcommerce",
 		version: options.version ?? "0.0.0",
@@ -226,6 +257,12 @@ export function createPlugin(options: CreatePluginOptions = {}) {
 		hooks: HOOKS,
 		routes: toNativeRoutes(ROUTES),
 		admin: {
+			// EmDash encrypts declared secrets at rest and registers log redaction.
+			settingsSchema: {
+				paystackSecretKey: { type: "secret", label: "Paystack test secret key" },
+				stripeSecretKey: { type: "secret", label: "Stripe secret key" },
+				stripeWebhookSecret: { type: "secret", label: "Stripe webhook signing secret" },
+			},
 			pages: ADMIN_PAGES,
 			widgets: ADMIN_WIDGETS,
 			fieldWidgets: FIELD_WIDGETS,

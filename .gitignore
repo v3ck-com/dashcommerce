@@ -1,6 +1,8 @@
 node_modules/
 dist/
 coverage/
+test-results/
+playwright-report/
 .astro/
 .turbo/
 *.tsbuildinfo
@@ -28,6 +30,12 @@ package-lock.json
 # local db / uploads (from example sites)
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/.spike/
 uploads/
 
 # logs

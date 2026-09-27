@@ -37,6 +37,7 @@ export interface ProductDetailsProduct {
 		is_downloadable?: boolean;
 		product_url?: string;
 		button_text?: string;
+		customisation_definition?: unknown;
 	};
 }
 
@@ -141,6 +142,7 @@ const outOfStock = d.stock_status === "outofstock";
 				currency: cc,
 			}))}
 			attributeKeys={Array.from(attributeKeys)}
+			customisationDefinition={d.customisation_definition}
 			disabled={outOfStock}
 		/>
 	)}

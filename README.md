@@ -1,301 +1,79 @@
-# DashCommerce
+# DashCommerce — v3ck-com fork
 
-**WooCommerce-class commerce for [EmDash CMS](https://github.com/emdash-cms/emdash)** — the Astro-native, Cloudflare-powered WordPress successor.
+A development fork of [emdashCommerce/dashcommerce](https://github.com/emdashCommerce/dashcommerce), adding **Paystack test checkout and personalised products** on **EmDash 0.41.0**.
 
-Full-featured ecommerce in one plugin: products, cart, checkout, orders, subscriptions, multi-vendor marketplace, and more. Runs on Cloudflare Workers or Node.js (Railway, Render, etc.). Typed end-to-end. Sandbox-safe. MIT licensed.
+**Test-mode software, not a production payment release.** No live Paystack payments, automatic fulfilment, real email, or real-order migration is enabled. This repository contains synthetic fixtures, not an existing shop or its customer data. MIT; upstream attribution and history are retained.
 
-## Get Started in 60 Seconds
+## Supported development target
 
-```sh
-npm create @dashcommerce@latest
-```
+- EmDash **exactly 0.41.0**; other versions fail closed.
+- Astro **7.3.5**, standalone Node, SQLite. Node 22.16+ and Bun 1.4.2.
+- Native EmDash `pluginResponse()` and bounded raw-byte webhook contracts. **No EmDash dependency patches.**
+- Trusted starter middleware owns cart cookies, method/origin checks and private caching. HTTPS uses a Secure `__Host-` cookie; HTTP is for loopback development.
+- Cloudflare Workers and PostgreSQL are **not certified** by this fork. Existing Stripe features remain legacy code, not newly certified live-payment functionality.
 
-Scaffolds a complete storefront with EmDash + DashCommerce, demo products, and Stripe test mode ready to go.
+## Implemented
 
-🎯 **Live Demo**: [demo.dashcommerce.dev](https://demo.dashcommerce.dev)  
-📘 **Docs**: [dashcommerce.dev/docs](https://dashcommerce.dev/docs)  
-💬 **Issues**: [github.com/emdashCommerce/dashcommerce/issues](https://github.com/emdashCommerce/dashcommerce/issues)
+- Explicit `paystack-test` provider; unknown providers fail rather than falling back to Stripe. Only `sk_test_` credentials and ZAR are accepted.
+- Fixed-origin Paystack initialize/verify transport, bounded responses, timeouts, redirect refusal, SHA-512 webhook verification, and independently verified transaction identity/amount/currency/test domain/email.
+- Server-priced checkout with complete shipping/billing addresses; current stock, personalisation, supported flat/free shipping and flat tax are revalidated.
+- Durable checkout identity, one initialization claim, retry-safe references, recoverable order/item/payment writes, and concurrent callback/webhook handling using EmDash revision CAS.
+- CAS stock reservations and idempotent consumption. A late payment with unavailable inventory is held for manual review, never silently re-reserved.
+- Merchant-defined bounded text personalisation, separate cart lines for distinct options, and propagation to orders and receipts.
+- Browser checkout, authoritative return polling, pending/failure/review states, uncertainty recovery link, and conditional purchased-cart cleanup that preserves newer edits.
+- Durable **preview-only** receipt outbox. No Resend delivery or Yoco integration is activated; newsletters are outside this implementation.
 
-## Current Release
+## Run the checks
 
-**v0.2.0** on npm — compatible with **EmDash 0.37+**
-
-| Package | Version | EmDash Compatibility |
-|---|---|---|
-| [`@dashcommerce/core`](https://www.npmjs.com/package/@dashcommerce/core) | 0.2.0 | EmDash ^0.37.0 |
-| `@dashcommerce/create` | 0.2.0 | Scaffolds EmDash 0.37+ projects |
-
-The v1.0 feature roadmap is code-complete. SemVer: `0.x` may include minor breaking changes until **1.0.0** — see [CHANGELOG.md](./CHANGELOG.md).
-
-## Why DashCommerce
-
-- **Deploy Anywhere**: Cloudflare Workers (edge) or Node.js (Railway, Render, your VPS)
-- **Modern Auth**: Passkey support via EmDash's built-in auth system
-- **Stripe Native**: Hosted Checkout, Payment Element, Subscriptions, Connect for multi-vendor
-- **Type-Safe**: End-to-end TypeScript, from admin UI to storefront islands
-- **Sandbox-Safe**: No Node.js built-ins — runs in EmDash's hardened plugin sandbox
-- **Open Source**: MIT core; extensible plugin architecture
-
-## Feature Highlights
-
-Every feature category WooCommerce ships, in one plugin:
-
-**Core Commerce**: Products (simple, variable, subscription, digital), multi-currency, cart, hosted Stripe checkout, orders with refunds, customer portal
-
-**Growth Tools**: Coupons, shipping zones, tax automation (Stripe Tax optional), inventory management, reviews
-
-**Advanced**: Subscriptions with trials & dunning, multi-vendor marketplace (Stripe Connect), abandoned cart recovery, transactional email
-
-**Admin**: React-based dashboard with 12 pages, revenue reports, top products/customers, MRR tracking
-
-See [**What's in the box**](#whats-in-the-box) below for the complete feature breakdown.
-
-## Upgrading from 0.1.x?
-
-DashCommerce 0.2.x requires EmDash 0.37+. If you're on 0.1.x (EmDash 0.28.x), follow the migration guide below.
-
-**⚠️ Important**: Do NOT mix DashCommerce 0.2.x with EmDash < 0.37.0, or DashCommerce 0.1.x with EmDash >= 0.29.0. Incompatible versions fail with clear error messages at plugin initialization.
-
-### Upgrade Path: 0.1.x → 0.2.x
-
-**Prerequisites**: Backup your database and verify your local dev environment works before upgrading production.
-
-**Step 1: Update all dependencies together**
-
-```bash
-# Install EmDash 0.37 + DashCommerce 0.2.x simultaneously
-npm install emdash@^0.37.0 @emdash-cms/admin@^0.37.0 @dashcommerce/core@^0.2.0
-
-# For Cloudflare deployments, also update:
-npm install @emdash-cms/cloudflare@^0.37.0
-```
-
-**Step 2: Apply EmDash patch (required)**
-
-DashCommerce requires [a small patch to EmDash](/packages/core/patches/emdash@0.37.0.patch) for webhook handling and response passthrough. The patch is shipped with `@dashcommerce/core@0.2.0` and documented in [`packages/core/patches/README.md`](/packages/core/patches/README.md).
-
-```bash
-# Using Bun (recommended) - add to package.json:
-{
-  "patchedDependencies": {
-    "emdash@0.37.0": "node_modules/@dashcommerce/core/patches/emdash@0.37.0.patch"
-  }
-}
-
-# Then reinstall:
-bun install
-```
-
-See [`patches/README.md`](/packages/core/patches/README.md) for pnpm/npm/yarn instructions.
-
-**Step 3: Update Astro config (if using Cloudflare Workers)**
-
-EmDash 0.37 imports `cloudflare:*` runtime modules that must be externalized for Node.js builds:
-
-```ts
-// astro.config.mjs
-export default defineConfig({
-  // ... existing config
-  vite: {
-    build: {
-      rollupOptions: {
-        external: target === "node" ? [/^cloudflare:/] : [],
-      },
-    },
-  },
-});
-```
-
-**Step 4: Test checkout and webhooks**
-
-1. Place a test order using Stripe test cards
-2. Verify webhook signature verification works
-3. Check that Stripe webhooks return HTTP 200 (not `{}`)
-4. Test subscription creation/renewal if using subscriptions
-
-**Step 5: Deploy to production**
-
-After verifying everything works locally, deploy to your hosting environment and monitor for any compatibility warnings in logs.
-
-### Stay on 0.1.x (no action required)
-
-If you're not ready to upgrade to EmDash 0.37:
-
-```bash
-# Pin to the latest 0.1.x release
-npm install @dashcommerce/core@^0.1.5
-
-# Keep EmDash on 0.28.x
-npm install emdash@^0.28.0 @emdash-cms/admin@^0.28.0
-```
-
-The 0.1.x line remains on npm and will continue working with EmDash 0.28.x. However, new features and non-security fixes will only land in 0.2.x+.
-
-### Breaking Changes in 0.2.0
-
-- **Minimum EmDash version**: Now `0.37.0` (was `0.28.0`)
-- **Patch required**: Must apply `emdash@0.37.0` patch for webhooks to work
-- **Node.js builds**: Must externalize `cloudflare:*` modules in Vite config
-- **Runtime version check**: Plugin will throw on incompatible EmDash versions (fail-closed for safety)
-
-See [CHANGELOG.md](/CHANGELOG.md) for full release notes.
-
-## What's in the box
-
-| Area | What ships |
-|---|---|
-| **Products** | Simple, variable (size/color/etc), grouped, external/affiliate, subscription, digital-download — one collection, one type switch |
-| **Multi-currency** | Per-product price maps, customer-selected currency at cart, per-currency minor-units handling |
-| **Cart & Checkout** | Hosted Stripe Checkout (default) + embedded Payment Element fallback; Apple/Google Pay; guest + logged-in |
-| **Orders** | Admin dashboard with refund / partial-refund UI, order timeline, draft-to-paid pipeline |
-| **Customers** | Address book, order history, self-service portal (email-link, no password needed for first access) |
-| **Coupons** | Fixed/percent × cart/product, free-shipping, exclusions, usage limits, per-customer caps |
-| **Shipping** | Multi-zone, flat-rate / free / local-pickup / weight-based; per-product shipping classes |
-| **Tax** | Flat-rate, rate-table (by country/region), or Stripe Tax (automatic); tax on shipping toggle |
-| **Inventory** | Soft-locks during checkout prevent overselling; low-stock alerts; backorder policy per product |
-| **Subscriptions** | Stripe Subscriptions, trials, upgrade/downgrade, pause/resume, dunning, customer portal |
-| **Digital downloads** | Signed-URL token downloads, TTL + max-use enforcement, per-order grants |
-| **Reviews** | Moderation queue, verified-purchase badge, review aggregates on product pages |
-| **Multi-vendor** | Stripe Connect Express onboarding, single-vendor-per-order splits, platform fee, vendor payouts |
-| **Abandoned cart** | Cron-driven reminder emails with signed restore links |
-| **Transactional email** | Receipt, refund, subscription renewal, dunning, abandoned cart, review request, vendor invite/activation/payout — HTML + plain text |
-| **Reports** | Revenue / top products / top customers / MRR inside the admin dashboard |
-| **Admin UI** | 12 React pages + 5 dashboard widgets + 2 field widgets + 3 Portable Text blocks |
-
-## Packages
-
-| Package | Description |
-|---|---|
-| [`@dashcommerce/core`](./packages/core) | The plugin — hooks, routes, admin UI, storefront islands |
-| [`@dashcommerce/starter`](./packages/starter) | Reference EmDash storefront that exercises every feature |
-
-The marketing / docs site source also lives in this monorepo under [`site/`](./site) and serves <https://dashcommerce.dev>.
-
-## Quick start
-
-### Already have an EmDash site? (30 seconds)
+These checks create disposable databases and synthetic keys. Provider HTTP, DNS and the hosted payment page are intercepted locally; no Paystack/Stripe charge or email is sent.
 
 ```sh
-bun add @dashcommerce/core
-```
-
-Register the plugin in `astro.config.mjs`:
-
-```ts
-import { dashcommerce } from "@dashcommerce/core";
-
-emdash({ plugins: [dashcommerce()] });
-```
-
-Merge the products collection + taxonomies into your seed file and re-apply:
-
-```sh
-bunx dashcommerce-merge-seed
-bun emdash seed --on-conflict=update
-```
-
-Open `/_emdash/admin/plugins/dashcommerce/settings` and paste your Stripe test keys.
-
-Want sample data to play with? Add `--with-demo-catalog` to seed six example products (one per type) plus curated category/tag terms:
-
-```sh
-bunx dashcommerce-merge-seed --with-demo-catalog
-bun emdash seed --on-conflict=update
-```
-
-The merge step is idempotent — it only replaces DashCommerce's own entries (the `products` collection, `product_category` / `product_tag` taxonomies) and, with `--with-demo-catalog`, only appends demo products whose ids aren't already in your seed. Everything else is preserved. If you prefer to assemble the seed in code, import `mergeDashCommerceSeed(seed, { withDemoCatalog })` from `@dashcommerce/core`.
-
-### Starting fresh?
-
-Use the scaffold command from the top of this README:
-
-```sh
-npm create @dashcommerce@latest
-```
-
-This clones [`@dashcommerce/starter`](./packages/starter) with a fully-wired storefront, demo catalog, and Stripe test mode ready.
-
-Or wire it manually:
-
-```ts
-// astro.config.mjs
-import { defineConfig } from "astro/config";
-import emdash from "emdash/astro";
-import { sqlite } from "emdash/db";
-import { local } from "emdash/storage/local";
-import { dashcommerce } from "@dashcommerce/core";
-
-export default defineConfig({
-  integrations: [
-    emdash({
-      database: sqlite({ url: "file:./data.db" }),
-      storage: local({ directory: "./uploads", baseUrl: "/_emdash/api/media/file" }),
-      plugins: [dashcommerce()],
-    }),
-  ],
-});
-```
-
-```sh
-bun emdash init
-bunx dashcommerce-merge-seed
-bun emdash seed --on-conflict=update
-bun dev
-```
-
-Full walkthrough: [Getting started](https://dashcommerce.dev/docs/getting-started) · [Stripe setup](https://dashcommerce.dev/docs/stripe).
-
-## Architecture at a glance
-
-```
-astro.config.mjs
-  └─ emdash({ plugins: [dashcommerce()] })
-       │
-       ├─ Vite build ──► packages/core/src/index.ts          # descriptor only, side-effect-free
-       │
-       └─ Runtime    ──► packages/core/src/sandbox-entry.ts  # hooks + routes
-                          │
-                          ├─ routes/cart.ts        (public)
-                          ├─ routes/checkout.ts   (public)
-                          ├─ routes/webhook.ts    (public; Stripe-signed)
-                          ├─ routes/admin-api.ts  (admin-gated)
-                          └─ …12 more
-```
-
-Hard rules the sandbox entry and everything it imports obey:
-
-- No Node built-ins (`fs`, `crypto`, `node:*`) — crypto via `crypto.subtle`, HTTP via `ctx.http.fetch`
-- All money as integer minor units (`Money = { currency, amount }`), ISO 4217; mixed-currency ops throw
-- Every Stripe webhook is idempotent via unique-indexed Stripe IDs; duplicates return HTTP 200
-- Webhook signature verification happens before any side effect
-- Cart re-prices server-side on every mutation *and* on every read — no client-sent prices trusted
-
-## Development
-
-```sh
-bun install
+bun install --frozen-lockfile
+bun run test
 bun run typecheck
 bun run build
-bun test          # 66 tests across money / cart / coupons / webhook / tokens / split
+bun run test:host
+bun run test:http
+bunx playwright install chromium
+bun run test:browser
+bun audit --production
 ```
 
-Per-package loop:
+CI runs the same gates on Node 22 and 24, with no payment credentials. Browser tests use the real cart, checkout, payment verification and order endpoints; only the external provider is simulated. Additional UI-state tests stub authority responses deliberately.
 
-```sh
-cd packages/core && bun run dev    # tsdown --watch
-cd packages/starter && bun run dev # Astro on :4321
+## Configure a fresh local store
+
+Use a **new, disposable database** first. The inherited seed/bootstrap commands can replace matching collection definitions: do not run them against an existing shop without a migration plan and backup.
+
+1. Follow the [starter instructions](packages/starter/README.md) and complete EmDash owner setup.
+2. Set a persistent private `EMDASH_ENCRYPTION_KEY` using EmDash's supported configuration. Keep environment files and credentials out of Git.
+3. In DashCommerce settings, choose **Paystack — test mode only**, enter the test secret, choose **hosted** checkout, and configure ZAR as an enabled/default currency. Native EmDash secret settings encrypt the secret at rest; the admin API returns only secret presence/hints.
+4. Set ZAR product prices and finite managed stock. Configure supported delivery methods for the intended country. Fixture shipping/tax values are examples, not merchant-approved business rules.
+5. Configure the canonical site URL. Callbacks require HTTPS, except explicit loopback HTTP development. Public webhook ingress is a separate deployment decision.
+
+Webhook: `POST /_emdash/api/plugins/dashcommerce/checkout/paystack-webhook`.
+Return verification: `GET /_emdash/api/plugins/dashcommerce/orders/by-draft?id=<private-draft-capability>`.
+Never treat query-string payment status or a browser redirect as proof of payment.
+
+### Personalisation schema
+
+A product's `customisation_definition` JSON can contain up to four text fields:
+
+```json
+{"fields":[{"key":"recipient_name","required":true,"maxLength":40}]}
 ```
 
-Stripe webhook forwarding for local dev:
+Keys are validated; text is trimmed, bounded (maximum 120 characters per field), escaped when displayed, and revalidated against the current product definition at checkout. Rich conditional options, uploads and paid extras are not implemented.
 
-```sh
-stripe listen --forward-to localhost:4321/_emdash/api/plugins/dashcommerce/checkout/webhook
-```
+## Operational limits
 
-## Contributing
+- Test payments create TEST-labelled, on-hold orders. `paymentStatus: "paid"` means a **verified sandbox transaction** only when paired with `paymentProvider: "paystack-test"` and test metadata. It is not live money or permission to fulfil.
+- Preview outbox entries are private plugin KV records under `receipt-preview:` with `delivery: "disabled"`; no mail transport runs.
+- Ambiguous initialization is not automatically repeated. Keep its private draft reference and reconcile; a crash before the provider POST may need operator intervention.
+- Inventory is maintained in a single CAS projection, not simultaneously decremented in CMS fields. Out-of-band CMS stock changes require explicit `reconcileInventory` from `packages/core/src/inventory/index.ts`. A merchant reconciliation UI, retention policy and high-volume partitioning are not provided.
+- Legacy Stripe inventory/finalization must not be mixed with this projection without a separate compatibility/reconciliation plan. This fork does not claim production Stripe regression certification.
+- Coupons, subscriptions, Connect, non-standard tax classes, advanced shipping, untracked/backorder stock, live Paystack and Paystack refunds are rejected in the test checkout.
+- Production still needs independent security/operations review, merchant-approved shipping/tax/discount rules, reconciliation/refunds, backups, HTTPS, privacy/retention controls and fulfilment validation. Keep private order capabilities out of analytics and referrer logs.
+- Existing stores, infrastructure, DNS and deployments are not modified by these scripts. There is no automatic migration from WordPress, another commerce implementation, or earlier experimental payment records.
 
-Pre-release, so the surface is still shifting. Small PRs welcome; large new features please open an issue first so we can align with the roadmap in `CHANGELOG.md`.
-
-## License
-
-MIT
+The fork is source-only: npm release and upstream synchronization workflows are removed, and the core package is marked private to prevent accidental publication under the upstream npm name. See [upstream](https://github.com/emdashCommerce/dashcommerce) for its original feature documentation; those broader claims are not a certification of this fork.

@@ -2,7 +2,7 @@
   "name": "dashcommerce-monorepo",
   "private": true,
   "version": "0.0.0",
-  "description": "DashCommerce \u2014 the WooCommerce-equivalent commerce plugin for the EmDash ecosystem",
+  "description": "DashCommerce — the WooCommerce-equivalent commerce plugin for the EmDash ecosystem",
   "type": "module",
   "workspaces": [
     "packages/*"
@@ -12,22 +12,24 @@
     "build": "bun run --filter '*' build",
     "dev": "bun run --filter '*' dev",
     "test": "bun run --filter '*' test",
+    "test:host": "node --test packages/starter/test/emdash-041-host.test.mjs && node scripts/host-http-smoke.mjs",
+    "test:http": "node scripts/test-paystack-http.mjs",
+    "test:browser": "playwright test --config packages/starter/playwright.config.mjs",
     "format": "biome format --write .",
     "lint": "biome lint .",
     "postinstall": "bun run --cwd packages/core build",
-    "changeset": "changeset",
-    "release": "bun run --filter '*' build && changeset publish"
+    "changeset": "changeset"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.31.0",
+    "@playwright/test": "1.63.0",
     "typescript": "^5.9.3"
   },
+  "packageManager": "bun@1.4.2",
   "engines": {
-    "bun": ">=1.1.0"
-  },
-  "patchedDependencies": {
-    "emdash@0.37.0": "patches/emdash@0.37.0.patch"
+    "node": ">=22.16.0",
+    "bun": ">=1.4.2"
   }
 }

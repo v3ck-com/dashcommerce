@@ -83,10 +83,35 @@ export async function adjustVariantStock(
 	variantId: string,
 	delta: number,
 ): Promise<number | null> {
+	if (!Number.isSafeInteger(delta) || delta === 0) {
+		throw new Error("Variant stock delta must be a non-zero safe integer");
+	}
+	const variants = variantsStore(ctx);
+	// The read only identifies untracked stock. The guarded delta below is the
+	// stock decision: it prevents two order workers from both consuming the
+	// last unit between a read and a write.
 	const variant = await getVariant(ctx, variantId);
 	if (!variant) throw new Error(`Variant ${variantId} not found`);
 	if (variant.stockQuantity === null) return null;
-	const next = variant.stockQuantity + delta;
-	await putVariant(ctx, { ...variant, stockQuantity: next });
-	return next;
+	if (!Number.isSafeInteger(variant.stockQuantity) || variant.stockQuantity < 0) {
+		throw new Error(`Variant ${variantId} has invalid stock`);
+	}
+	if (typeof variants.updateIf !== "function") {
+		throw new Error("EmDash conditional storage is required for variant stock updates");
+	}
+	const amount = Math.abs(delta);
+	const result = await variants.updateIf(variantId, {
+		// Positive adjustments still require a finite tracked quantity, so a
+		// concurrent switch to untracked/null stock fails closed.
+		where: { stockQuantity: { gte: delta < 0 ? amount : 0 } },
+		delta: { stockQuantity: delta < 0 ? { dec: amount } : { inc: amount } },
+	});
+	if (!result.applied || !Number.isSafeInteger(result.data.stockQuantity)) {
+		throw new Error(
+			delta < 0
+				? `Insufficient stock for variant ${variantId}`
+				: `Variant ${variantId} stock update conflicted`,
+		);
+	}
+	return result.data.stockQuantity;
 }

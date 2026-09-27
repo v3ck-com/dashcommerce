@@ -1,8 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import {
-	decrementForOrderItem,
-	OversoldError,
-} from "../src/inventory/decrement";
+import { decrementForOrderItem, OversoldError } from "../src/inventory/decrement";
 import { money } from "../src/money";
 import type { OrderItem, ProductFields } from "../src/types";
 
@@ -75,11 +72,7 @@ function makeCtx(opts: {
 				if (collection !== "products") return null;
 				return productStore.get(id) ?? null;
 			},
-			async update(
-				collection: string,
-				id: string,
-				patch: Record<string, unknown>,
-			) {
+			async update(collection: string, id: string, patch: Record<string, unknown>) {
 				if (collection !== "products") return;
 				productUpdates.push([id, patch]);
 				const row = productStore.get(id) as { data: ProductFields } | undefined;
@@ -95,6 +88,28 @@ function makeCtx(opts: {
 				},
 				async put(id: string, data: unknown) {
 					variantStore.set(id, data);
+				},
+				async updateIf(
+					id: string,
+					args: {
+						where: { stockQuantity?: { gte?: number } };
+						delta: { stockQuantity?: { inc?: number; dec?: number } };
+					},
+				) {
+					const current = variantStore.get(id) as { stockQuantity?: unknown } | undefined;
+					const stock = current?.stockQuantity;
+					const minimum = args.where.stockQuantity?.gte;
+					if (
+						!current ||
+						!Number.isSafeInteger(stock) ||
+						(minimum !== undefined && stock < minimum)
+					)
+						return { applied: false as const };
+					const delta = args.delta.stockQuantity;
+					const next = stock + (delta?.inc ?? 0) - (delta?.dec ?? 0);
+					const data = { ...current, stockQuantity: next };
+					variantStore.set(id, data);
+					return { applied: true as const, data };
 				},
 				async query() {
 					return { items: [], hasMore: false };
@@ -120,9 +135,7 @@ function makeCtx(opts: {
 	return { ctx, ledgerWrites, productUpdates, variantStore, productStore };
 }
 
-function orderItem(
-	overrides: Partial<OrderItem> = {},
-): OrderItem {
+function orderItem(overrides: Partial<OrderItem> = {}): OrderItem {
 	return {
 		id: "oi1",
 		orderId: "o1",
@@ -174,18 +187,18 @@ describe("decrementForOrderItem — product path", () => {
 
 	it("throws OversoldError when decrement would go negative", async () => {
 		const { ctx } = makeCtx({ product: baseProduct({ stockQuantity: 1 }) });
-		await expect(
-			decrementForOrderItem(ctx, orderItem({ quantity: 3 })),
-		).rejects.toBeInstanceOf(OversoldError);
+		await expect(decrementForOrderItem(ctx, orderItem({ quantity: 3 }))).rejects.toBeInstanceOf(
+			OversoldError,
+		);
 	});
 
 	it("leaves stock untouched when throwing (no partial write)", async () => {
 		const { ctx, productUpdates } = makeCtx({
 			product: baseProduct({ stockQuantity: 1 }),
 		});
-		await expect(
-			decrementForOrderItem(ctx, orderItem({ quantity: 3 })),
-		).rejects.toBeInstanceOf(OversoldError);
+		await expect(decrementForOrderItem(ctx, orderItem({ quantity: 3 }))).rejects.toBeInstanceOf(
+			OversoldError,
+		);
 		expect(productUpdates).toHaveLength(0);
 	});
 
@@ -228,10 +241,7 @@ describe("decrementForOrderItem — product path", () => {
 describe("decrementForOrderItem — variant path", () => {
 	it("decrements a variant with sufficient stock", async () => {
 		const { ctx, variantStore } = makeCtx({ variantStock: 4 });
-		const result = await decrementForOrderItem(
-			ctx,
-			orderItem({ variantId: "v1", quantity: 2 }),
-		);
+		const result = await decrementForOrderItem(ctx, orderItem({ variantId: "v1", quantity: 2 }));
 		expect(result.newStock).toBe(2);
 		const v = variantStore.get("v1") as { stockQuantity: number };
 		expect(v.stockQuantity).toBe(2);
@@ -246,10 +256,7 @@ describe("decrementForOrderItem — variant path", () => {
 
 	it("skips when variant is not tracking stock", async () => {
 		const { ctx, variantStore } = makeCtx({ variantStock: null });
-		const result = await decrementForOrderItem(
-			ctx,
-			orderItem({ variantId: "v1" }),
-		);
+		const result = await decrementForOrderItem(ctx, orderItem({ variantId: "v1" }));
 		expect(result.newStock).toBeNull();
 		const v = variantStore.get("v1") as { stockQuantity: unknown };
 		expect(v.stockQuantity).toBeNull();

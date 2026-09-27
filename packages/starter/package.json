@@ -17,7 +17,8 @@
 		"cf:dev": "bun run build:cf && wrangler dev --config dist/server/wrangler.json",
 		"cf:d1:create": "wrangler d1 create dashcommerce-demo",
 		"cf:d1:seed": "node scripts/cf-d1-seed.mjs",
-		"typecheck": "astro check"
+		"typecheck": "astro check",
+		"test:host": "node --test test/emdash-041-host.test.mjs"
 	},
 	"emdash": {
 		"label": "DashCommerce Starter",
@@ -26,16 +27,16 @@
 		"preview": "https://demo.dashcommerce.dev"
 	},
 	"dependencies": {
-		"@astrojs/cloudflare": "^13.1.10",
-		"@astrojs/node": "^10.0.0",
-		"@astrojs/react": "^5.0.0",
+		"@astrojs/cloudflare": "14.3.3",
+		"@astrojs/node": "11.1.6",
+		"@astrojs/react": "7.0.0",
 		"@astrojs/sitemap": "^3.4.0",
 		"@dashcommerce/core": "workspace:*",
-		"@emdash-cms/cloudflare": "^0.37.0",
+		"@emdash-cms/cloudflare": "0.41.0",
 		"@stripe/react-stripe-js": "^6.0.0",
 		"@stripe/stripe-js": "^9.0.0",
-		"astro": "^6.0.0",
-		"emdash": "^0.37.0",
+		"astro": "7.3.5",
+		"emdash": "0.41.0",
 		"react": "^19.0.0",
 		"react-dom": "^19.0.0"
 	},
@@ -46,7 +47,7 @@
 		"@types/react": "^19.0.0",
 		"@types/react-dom": "^19.0.0",
 		"typescript": "^5.9.0",
-		"wrangler": "^4.83.0"
+		"wrangler": "^4.125.0"
 	},
 	"keywords": [
 		"emdash",

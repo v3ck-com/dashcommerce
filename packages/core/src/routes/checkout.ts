@@ -19,6 +19,7 @@ import type { PluginContext, RouteContext } from "emdash";
 import { randomId } from "../util/ids";
 import { recalculate, type PricingPolicy } from "../cart/calculate";
 import { getCart, save } from "../cart/store";
+import { CUSTOMISATION_FIELD_SLUG, validateCustomisation } from "../cart/customisation";
 import { createLock, newLock, sumActiveLocksForProduct } from "../cart/lock";
 import { money, zero } from "../money";
 import { resolvePrice } from "../products/pricing";
@@ -36,6 +37,11 @@ import { computeSplit, connectEnabled } from "../vendors/split";
 import { resolveSessionId } from "./cart";
 import { DEFAULT_CHECKOUT_MODE, type CheckoutMode } from "../settings/schema";
 import { getPublicSiteUrl } from "../util/site-url";
+import { getHostedCheckoutProvider, PaymentProviderError } from "../payment-provider";
+import { startCheckout } from "../payment-provider/paystack-test";
+import { priceTestShippingAndTax } from "../shipping/checkout";
+import { isObject, validEmail } from "../cart/validation";
+import { InventoryError, MAX_INVENTORY_QUANTITY } from "../inventory";
 
 const DRAFT_PREFIX = "draft:";
 const DRAFT_TTL_MS = 15 * 60 * 1000;
@@ -74,11 +80,19 @@ interface RepriceResult {
 async function repriceAndCheckStock(
 	ctx: PluginContext,
 	cart: CartState,
+	reservationOwnsStockCheck = false,
 ): Promise<RepriceResult> {
 	const errors: RepriceError[] = [];
 	const out: CartLineItem[] = [];
 	const stockEntries: StockLockEntry[] = [];
 
+	if (reservationOwnsStockCheck && cart.items.length > 100) {
+		return {
+			items: [],
+			errors: [{ lineId: "*", productId: "*", reason: "At most 100 checkout lines supported" }],
+			stockEntries,
+		};
+	}
 	if (!ctx.content) {
 		return {
 			items: cart.items,
@@ -93,16 +107,55 @@ async function repriceAndCheckStock(
 		};
 	}
 
+	// Personalised lines can share stock. Validate the aggregate demand, not
+	// each line independently (two names must not each buy the last unit).
+	const stockKey = (line: CartLineItem) => JSON.stringify([line.productId, line.variantId ?? null]);
+	const requested = new Map<string, number>();
 	for (const line of cart.items) {
+		const key = stockKey(line);
+		requested.set(key, (requested.get(key) ?? 0) + line.quantity);
+	}
+
+	for (const line of cart.items) {
+		if (
+			!Number.isSafeInteger(line.quantity) ||
+			line.quantity < 1 ||
+			line.quantity > MAX_INVENTORY_QUANTITY ||
+			!Number.isSafeInteger(requested.get(stockKey(line)))
+		) {
+			errors.push({ lineId: line.lineId, productId: line.productId, reason: "invalid quantity" });
+			continue;
+		}
 		const record = await ctx.content.get("products", line.productId);
 		if (!record || record.status !== "published") {
 			errors.push({ lineId: line.lineId, productId: line.productId, reason: "unavailable" });
 			continue;
 		}
-		const fields = normalizeProductFields(
-			record.data as Record<string, unknown>,
+		const customisation = validateCustomisation(
+			(record.data as Record<string, unknown>)[CUSTOMISATION_FIELD_SLUG],
+			line.customisation,
 		);
+		if (!customisation.ok) {
+			errors.push({ lineId: line.lineId, productId: line.productId, reason: customisation.error });
+			continue;
+		}
+		const fields = normalizeProductFields(record.data as Record<string, unknown>);
+		if (
+			reservationOwnsStockCheck &&
+			(!["simple", "variable"].includes(fields.type) || fields.taxClass !== "standard")
+		) {
+			errors.push({
+				lineId: line.lineId,
+				productId: line.productId,
+				reason: "Unsupported product type or tax class",
+			});
+			continue;
+		}
 		const variant = line.variantId ? await getVariant(ctx, line.variantId) : null;
+		if (line.variantId && (!variant || variant.productId !== line.productId || !variant.isActive)) {
+			errors.push({ lineId: line.lineId, productId: line.productId, reason: "invalid variant" });
+			continue;
+		}
 		const priced = resolvePrice({ product: fields, variant, currency: cart.currency });
 		if (!priced) {
 			errors.push({
@@ -127,7 +180,15 @@ async function repriceAndCheckStock(
 		const tracked =
 			(variant && variant.stockQuantity !== null) ||
 			(fields.manageStock && fields.stockQuantity !== null);
-		if (tracked) {
+		if (reservationOwnsStockCheck && !tracked) {
+			errors.push({
+				lineId: line.lineId,
+				productId: line.productId,
+				reason: "Finite managed stock required for test checkout",
+			});
+			continue;
+		}
+		if (tracked && !reservationOwnsStockCheck) {
 			const onHand = variant?.stockQuantity ?? fields.stockQuantity ?? 0;
 			const locked = await sumActiveLocksForProduct(
 				ctx,
@@ -135,7 +196,7 @@ async function repriceAndCheckStock(
 				line.variantId ?? undefined,
 			);
 			const available = onHand - locked;
-			if (line.quantity > available && fields.backorders === "no") {
+			if (requested.get(stockKey(line))! > available && fields.backorders === "no") {
 				errors.push({
 					lineId: line.lineId,
 					productId: line.productId,
@@ -147,6 +208,11 @@ async function repriceAndCheckStock(
 
 		const repriced: CartLineItem = {
 			...line,
+			customisation: customisation.options,
+			// Provider capability checks must use current CMS semantics, not
+			// stale one-time/subscription metadata saved when the cart was added.
+			subscriptionConfig: fields.subscriptionConfig,
+			vendorId: fields.vendorId,
 			unitPrice: priced.unit,
 			lineSubtotal: money(priced.unit.currency, priced.unit.amount * line.quantity),
 			title: fields.title,
@@ -185,6 +251,23 @@ export const checkoutRoutes = {
 				});
 			}
 
+			let selectedProvider;
+			try {
+				selectedProvider = await getHostedCheckoutProvider(ctx);
+			} catch (err) {
+				if (err instanceof PaymentProviderError)
+					return new Response(JSON.stringify({ error: err.message }), { status: err.status });
+				throw err;
+			}
+			if (selectedProvider) {
+				return new Response(
+					JSON.stringify({ error: "Paystack test supports hosted checkout only." }),
+					{
+						status: 501,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
 			const client = await loadStripeClient(ctx);
 			if (!client) {
 				return new Response(
@@ -262,10 +345,10 @@ export const checkoutRoutes = {
 					if (plan.mode === "single-vendor") {
 						const g = plan.vendorGroups[0];
 						if (!g) {
-							return new Response(
-								JSON.stringify({ error: "Split plan missing vendor group" }),
-								{ status: 500, headers: { "Content-Type": "application/json" } },
-							);
+							return new Response(JSON.stringify({ error: "Split plan missing vendor group" }), {
+								status: 500,
+								headers: { "Content-Type": "application/json" },
+							});
 						}
 						transferData = { destination: g.stripeAccountId };
 						applicationFeeAmount = g.applicationFee.amount;
@@ -282,8 +365,7 @@ export const checkoutRoutes = {
 				} catch (err) {
 					return new Response(
 						JSON.stringify({
-							error:
-								err instanceof Error ? err.message : "Vendor split computation failed",
+							error: err instanceof Error ? err.message : "Vendor split computation failed",
 						}),
 						{ status: 409, headers: { "Content-Type": "application/json" } },
 					);
@@ -374,12 +456,23 @@ export const checkoutRoutes = {
 				});
 			}
 
-			const client = await loadStripeClient(ctx);
-			if (!client) {
-				return new Response(
-					JSON.stringify({ error: "Stripe not configured (settings:stripeSecretKey)" }),
-					{ status: 500, headers: { "Content-Type": "application/json" } },
-				);
+			let experimentalProviderForRoute;
+			try {
+				experimentalProviderForRoute = await getHostedCheckoutProvider(ctx);
+			} catch (err) {
+				if (err instanceof PaymentProviderError)
+					return new Response(JSON.stringify({ error: err.message }), { status: err.status });
+				throw err;
+			}
+			let stripeClient: StripeClientOptions | null = null;
+			if (!experimentalProviderForRoute) {
+				stripeClient = await loadStripeClient(ctx);
+				if (!stripeClient) {
+					return new Response(
+						JSON.stringify({ error: "Stripe not configured (settings:stripeSecretKey)" }),
+						{ status: 500, headers: { "Content-Type": "application/json" } },
+					);
+				}
 			}
 
 			// Hosted mode needs a shippingMethod + at least a partial ship-to
@@ -398,20 +491,38 @@ export const checkoutRoutes = {
 					);
 				}
 				if (!cart.shippingMethod) {
-					return new Response(
-						JSON.stringify({ error: "Select a shipping method first." }),
-						{ status: 409, headers: { "Content-Type": "application/json" } },
-					);
+					return new Response(JSON.stringify({ error: "Select a shipping method first." }), {
+						status: 409,
+						headers: { "Content-Type": "application/json" },
+					});
 				}
 			}
 
+			if (
+				!isObject(input) ||
+				Object.keys(input).some((k) => !["customerEmail", "notes"].includes(k)) ||
+				(input.customerEmail !== undefined && !validEmail(input.customerEmail)) ||
+				(input.notes !== undefined &&
+					(typeof input.notes !== "string" || input.notes.length > 2000))
+			) {
+				return new Response(
+					JSON.stringify({
+						error: "Invalid checkout fields; totals and addresses are server-owned",
+					}),
+					{ status: 400 },
+				);
+			}
 			const withContact: CartState = {
 				...cart,
 				...(input.customerEmail ? { customerEmail: input.customerEmail } : {}),
 				...(input.notes ? { notes: input.notes } : {}),
 			};
 
-			const { items, errors, stockEntries } = await repriceAndCheckStock(ctx, withContact);
+			const { items, errors, stockEntries } = await repriceAndCheckStock(
+				ctx,
+				withContact,
+				!!experimentalProviderForRoute,
+			);
 			if (errors.length > 0) {
 				return new Response(JSON.stringify({ error: "Cart validation failed", errors }), {
 					status: 409,
@@ -419,14 +530,46 @@ export const checkoutRoutes = {
 				});
 			}
 
+			if (experimentalProviderForRoute) {
+				try {
+					if (await connectEnabled(ctx))
+						throw new PaymentProviderError("Vendor splits unsupported", { status: 501 });
+					const priced = await priceTestShippingAndTax(ctx, { ...withContact, items });
+					const checkout = await startCheckout(
+						ctx,
+						(await ctx.kv.get<string>("settings:paystackSecretKey"))!,
+						priced,
+						stockEntries,
+						getPublicSiteUrl(ctx),
+					);
+					return new Response(JSON.stringify(checkout), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				} catch (err) {
+					if (err instanceof PaymentProviderError || err instanceof InventoryError)
+						return new Response(
+							JSON.stringify({
+								error: err.message,
+								code: err.code,
+								...(err instanceof PaymentProviderError && err.orderDraftId
+									? { orderDraftId: err.orderDraftId }
+									: {}),
+							}),
+							{
+								status: err instanceof PaymentProviderError ? err.status : 409,
+								headers: { "Content-Type": "application/json" },
+							},
+						);
+					throw err;
+				}
+			}
 			const policy = await readPricingPolicy(ctx);
 			const recalculated = recalculate({ ...withContact, items }, policy);
-			if (recalculated.total.amount <= 0) {
+			if (recalculated.total.amount <= 0)
 				return new Response(JSON.stringify({ error: "Order total must be positive" }), {
 					status: 400,
-					headers: { "Content-Type": "application/json" },
 				});
-			}
 			await save(ctx, recalculated);
 
 			const orderDraftId = randomId();
@@ -508,21 +651,21 @@ export const checkoutRoutes = {
 					]
 				: [];
 
-		// Discount as a negative line item — Stripe rejects negative
-		// `unit_amount` on Checkout, so we fold discounts into the
-		// unit price above. If a merchant wants the discount broken
-		// out visually on the Stripe page, they can use Stripe Coupons
-		// (a Pass 2 item).
+			// Discount as a negative line item — Stripe rejects negative
+			// `unit_amount` on Checkout, so we fold discounts into the
+			// unit price above. If a merchant wants the discount broken
+			// out visually on the Stripe page, they can use Stripe Coupons
+			// (a Pass 2 item).
 
-		// Use getPublicSiteUrl() to ensure we never use localhost or stale
-		// database options (emdash:site_url) for Stripe redirect URLs.
-		// Production deployments must set SITE_URL environment variable.
-		const siteUrl = getPublicSiteUrl(ctx);
+			// Use getPublicSiteUrl() to ensure we never use localhost or stale
+			// database options (emdash:site_url) for Stripe redirect URLs.
+			// Production deployments must set SITE_URL environment variable.
+			const siteUrl = getPublicSiteUrl(ctx);
 
-		// Pass `{CHECKOUT_SESSION_ID}` literally — Stripe substitutes
-		// it server-side on redirect.
-		const successUrl = `${siteUrl}/thank-you/${encodeURIComponent(orderDraftId)}?session_id={CHECKOUT_SESSION_ID}`;
-		const cancelUrl = `${siteUrl}/checkout?canceled=1`;
+			// Pass `{CHECKOUT_SESSION_ID}` literally — Stripe substitutes
+			// it server-side on redirect.
+			const successUrl = `${siteUrl}/thank-you/${encodeURIComponent(orderDraftId)}?session_id={CHECKOUT_SESSION_ID}`;
+			const cancelUrl = `${siteUrl}/checkout?canceled=1`;
 
 			// Vendor split (Connect). Reuses the single-vendor path from
 			// create-intent. Multi-vendor carts are rejected the same way.
@@ -534,10 +677,10 @@ export const checkoutRoutes = {
 					if (plan.mode === "single-vendor") {
 						const g = plan.vendorGroups[0];
 						if (!g) {
-							return new Response(
-								JSON.stringify({ error: "Split plan missing vendor group" }),
-								{ status: 500, headers: { "Content-Type": "application/json" } },
-							);
+							return new Response(JSON.stringify({ error: "Split plan missing vendor group" }), {
+								status: 500,
+								headers: { "Content-Type": "application/json" },
+							});
 						}
 						transferData = { destination: g.stripeAccountId };
 						applicationFeeAmount = g.applicationFee.amount;
@@ -595,6 +738,14 @@ export const checkoutRoutes = {
 					}
 				: undefined;
 
+			const client = stripeClient;
+			if (!client) {
+				return new Response(
+					JSON.stringify({ error: "Stripe not configured (settings:stripeSecretKey)" }),
+					{ status: 500, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
 			const session = await createCheckoutSession(
 				ctx,
 				{
@@ -602,9 +753,7 @@ export const checkoutRoutes = {
 					successUrl,
 					cancelUrl,
 					lineItems,
-					...(recalculated.customerEmail
-						? { customerEmail: recalculated.customerEmail }
-						: {}),
+					...(recalculated.customerEmail ? { customerEmail: recalculated.customerEmail } : {}),
 					...(hasPhysical && recalculated.shippingAddress
 						? {
 								shippingAddressCollection: {
@@ -623,9 +772,7 @@ export const checkoutRoutes = {
 					// and recomputes tax server-side on the hosted page.
 					...(stripeTaxEnabled ? { automaticTax: true } : {}),
 					...(subscriptionMetadata ? { subscriptionMetadata } : {}),
-					...(subscriptionTrialPeriodDays > 0
-						? { subscriptionTrialPeriodDays }
-						: {}),
+					...(subscriptionTrialPeriodDays > 0 ? { subscriptionTrialPeriodDays } : {}),
 					// One-time-payment-only fields. `createCheckoutSession`
 					// also gates these on `mode === "payment"`, but we
 					// skip the whole block for subscription carts to keep
@@ -652,10 +799,10 @@ export const checkoutRoutes = {
 			);
 
 			if (!session.url) {
-				return new Response(
-					JSON.stringify({ error: "Stripe did not return a hosted URL" }),
-					{ status: 502, headers: { "Content-Type": "application/json" } },
-				);
+				return new Response(JSON.stringify({ error: "Stripe did not return a hosted URL" }), {
+					status: 502,
+					headers: { "Content-Type": "application/json" },
+				});
 			}
 
 			return new Response(
@@ -683,7 +830,15 @@ export const checkoutRoutes = {
 			const ctx = (_ctx ?? (_routeCtx as unknown as PluginContext)) as PluginContext;
 			const mode =
 				(await ctx.kv.get<CheckoutMode>("settings:checkoutMode")) ?? DEFAULT_CHECKOUT_MODE;
-			return new Response(JSON.stringify({ mode }), {
+			let provider;
+			try {
+				provider = await getHostedCheckoutProvider(ctx);
+			} catch (err) {
+				if (err instanceof PaymentProviderError)
+					return new Response(JSON.stringify({ error: err.message }), { status: err.status });
+				throw err;
+			}
+			return new Response(JSON.stringify({ mode, provider: provider?.id ?? "stripe" }), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});

@@ -24,27 +24,18 @@ import { isUniqueViolation } from "../util/storage";
 import type { CartState, StripeEventRecord } from "../types";
 import { deleteLock, getLock } from "../cart/lock";
 import { clear as clearCart } from "../cart/store";
-import {
-	createOrderFromPaymentIntent,
-	findOrderByPaymentIntent,
-} from "../orders/create";
+import { createOrderFromPaymentIntent, findOrderByPaymentIntent } from "../orders/create";
 import { recordRefundFromWebhook } from "../orders/refund";
 import { verifyStripeSignature } from "../stripe/webhook-verify";
 import type { StripePaymentIntent } from "../stripe/payment-intents";
 import { retrievePaymentIntent } from "../stripe/payment-intents";
-import type {
-	StripeCheckoutSession,
-	StripeSessionAddress,
-} from "../stripe/checkout-sessions";
+import type { StripeCheckoutSession, StripeSessionAddress } from "../stripe/checkout-sessions";
 import type { StripeClientOptions } from "../stripe/client";
 import type { StripeRefund } from "../stripe/refunds";
 import type { StripeAccount, StripePayout } from "../stripe/connect";
 import type { StripeInvoice, StripeSubscription } from "../stripe/subscriptions";
 import type { Address, CountryCode, Customer } from "../types";
-import {
-	findVendorByStripeAccountId,
-	upsertVendorFromStripeAccount,
-} from "../vendors/onboarding";
+import { findVendorByStripeAccountId, upsertVendorFromStripeAccount } from "../vendors/onboarding";
 import { recordPayoutFromStripe } from "../vendors/payouts";
 import {
 	subsStore,
@@ -53,17 +44,20 @@ import {
 	findSubscription,
 } from "../subscriptions/create";
 import { handleInvoicePaymentFailed } from "../subscriptions/dunning";
-import {
-	sendSubscriptionRenewed,
-	sendVendorActivated,
-	sendVendorPayout,
-} from "../emails";
+import { sendSubscriptionRenewed, sendVendorActivated, sendVendorPayout } from "../emails";
 import { draftKey, type CheckoutDraftSnapshot } from "./checkout";
+import { PaymentProviderError } from "../payment-provider";
+import {
+	attemptForReference,
+	reconcileAttempt,
+	verifySignature,
+	testKey,
+} from "../payment-provider/paystack-test";
+import { finalizePaystackTest } from "../orders/paystack";
 
 type StripeEventsStore = StorageCollection<StripeEventRecord>;
 function stripeEventsStore(ctx: PluginContext): StripeEventsStore {
-	return (ctx.storage as unknown as { stripe_events: StripeEventsStore })
-		.stripe_events;
+	return (ctx.storage as unknown as { stripe_events: StripeEventsStore }).stripe_events;
 }
 
 /**
@@ -129,10 +123,10 @@ async function handlePaymentIntentSucceeded(
 				headers: { "Content-Type": "application/json" },
 			});
 		}
-		return new Response(
-			JSON.stringify({ received: true, deferredToSessionCompleted: true }),
-			{ status: 200, headers: { "Content-Type": "application/json" } },
-		);
+		return new Response(JSON.stringify({ received: true, deferredToSessionCompleted: true }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
 	}
 
 	// Idempotent: return on duplicate
@@ -405,9 +399,7 @@ async function handleCheckoutSessionCompleted(
 
 	const cart: CartState = {
 		...snapshot.cart,
-		...(session.customer_details?.email
-			? { customerEmail: session.customer_details.email }
-			: {}),
+		...(session.customer_details?.email ? { customerEmail: session.customer_details.email } : {}),
 		...(shippingAddr ? { shippingAddress: shippingAddr } : {}),
 		...(billingAddr
 			? { billingAddress: billingAddr }
@@ -429,10 +421,10 @@ async function handleCheckoutSessionCompleted(
 				sessionId: session.id,
 				orderDraftId,
 			});
-			return new Response(
-				JSON.stringify({ error: "Session missing address" }),
-				{ status: 500, headers: { "Content-Type": "application/json" } },
-			);
+			return new Response(JSON.stringify({ error: "Session missing address" }), {
+				status: 500,
+				headers: { "Content-Type": "application/json" },
+			});
 		}
 	}
 
@@ -440,10 +432,10 @@ async function handleCheckoutSessionCompleted(
 	// fields it reads (amount_received, latest_charge, status, etc.).
 	const client = await loadStripeClient(ctx);
 	if (!client) {
-		return new Response(
-			JSON.stringify({ error: "Stripe not configured" }),
-			{ status: 500, headers: { "Content-Type": "application/json" } },
-		);
+		return new Response(JSON.stringify({ error: "Stripe not configured" }), {
+			status: 500,
+			headers: { "Content-Type": "application/json" },
+		});
 	}
 	const pi = await retrievePaymentIntent(ctx, session.payment_intent, client);
 
@@ -512,10 +504,7 @@ interface StripeCharge {
 	refunds?: { data: StripeRefund[] };
 }
 
-async function handleChargeRefunded(
-	ctx: PluginContext,
-	charge: StripeCharge,
-): Promise<Response> {
+async function handleChargeRefunded(ctx: PluginContext, charge: StripeCharge): Promise<Response> {
 	if (!charge.payment_intent) {
 		return new Response(JSON.stringify({ received: true, skipped: true }), {
 			status: 200,
@@ -543,13 +532,72 @@ async function handleChargeRefunded(
 	});
 }
 
-async function readRawBody(req: Request): Promise<string> {
-	return req.text();
+async function readRawBody(ctx: RouteContext): Promise<string> {
+	// EmDash 0.41 consumes the stream once into declared bytes input. Never
+	// stringify parsed JSON: whitespace/encoding are part of the signature.
+	if (ctx.input instanceof Uint8Array) {
+		return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(ctx.input);
+	}
+	// Direct handler tests/legacy callers only. The real host keeps its body
+	// guard intact, so missing route metadata fails rather than guessing bytes.
+	return ctx.request.text();
 }
 
 export const webhookRoutes = {
+	"checkout/paystack-webhook": {
+		public: true,
+		methods: ["POST"] as const,
+		request: { body: "bytes" as const, maxBytes: 262144 },
+		handler: async (routeCtx: RouteContext, _ctx?: PluginContext) => {
+			const ctx = (_ctx ?? (routeCtx as unknown as PluginContext)) as PluginContext;
+			try {
+				const key = await ctx.kv.get<string>("settings:paystackSecretKey");
+				testKey(key);
+				const payload =
+					routeCtx.input instanceof Uint8Array
+						? routeCtx.input
+						: new Uint8Array(await routeCtx.request.arrayBuffer());
+				await verifySignature(payload, routeCtx.request.headers.get("x-paystack-signature"), key);
+				let event: { event?: string; data?: { reference?: string } };
+				try {
+					event = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
+				} catch {
+					throw new PaymentProviderError("Invalid webhook JSON");
+				}
+				if (event.event !== "charge.success" || typeof event.data?.reference !== "string")
+					return new Response(JSON.stringify({ received: true, ignored: true }), { status: 200 });
+				const attempt = await attemptForReference(ctx, event.data.reference);
+				if (!attempt) throw new PaymentProviderError("Unknown payment reference", { status: 400 });
+				const current = await reconcileAttempt(ctx, key, attempt);
+				if (current.outcome !== "verified")
+					throw new PaymentProviderError(`Payment ${current.outcome ?? "pending"}`, {
+						status: 409,
+					});
+				const { order, duplicate } = await finalizePaystackTest(ctx, current);
+				return new Response(
+					JSON.stringify({ received: true, orderId: order.id, duplicate, testMode: true }),
+					{ status: 200 },
+				);
+			} catch (err) {
+				if (err instanceof PaymentProviderError) {
+					ctx.log.warn("Paystack test webhook rejected", {
+						code: err.code,
+						error: err.message,
+					});
+					return new Response(JSON.stringify({ error: err.message, code: err.code }), {
+						status: err.status,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw err;
+			}
+		},
+	},
+
 	"checkout/webhook": {
 		public: true,
+		methods: ["POST"] as const,
+		request: { body: "bytes" as const, maxBytes: 262144 },
 		handler: async (routeCtx: RouteContext, _ctx?: PluginContext) => {
 			const ctx = (_ctx ?? (routeCtx as unknown as PluginContext)) as PluginContext;
 			const req = routeCtx.request;
@@ -569,7 +617,7 @@ export const webhookRoutes = {
 				});
 			}
 
-			const payload = await readRawBody(req);
+			const payload = await readRawBody(routeCtx);
 			const verified = await verifyStripeSignature({
 				payload,
 				signatureHeader: sigHeader,
@@ -577,10 +625,10 @@ export const webhookRoutes = {
 			});
 			if (!verified.ok) {
 				ctx.log.warn("Stripe webhook signature invalid", { reason: verified.reason });
-				return new Response(
-					JSON.stringify({ error: `Invalid signature: ${verified.reason}` }),
-					{ status: 400, headers: { "Content-Type": "application/json" } },
-				);
+				return new Response(JSON.stringify({ error: `Invalid signature: ${verified.reason}` }), {
+					status: 400,
+					headers: { "Content-Type": "application/json" },
+				});
 			}
 
 			let event: {
@@ -605,10 +653,10 @@ export const webhookRoutes = {
 			if (event.id) {
 				const fresh = await recordStripeEvent(ctx, event.id, event.type);
 				if (!fresh) {
-					return new Response(
-						JSON.stringify({ received: true, duplicate: true }),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					);
+					return new Response(JSON.stringify({ received: true, duplicate: true }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
 				}
 			}
 
@@ -621,10 +669,7 @@ export const webhookRoutes = {
 						);
 					case "payment_intent.payment_failed":
 					case "payment_intent.canceled":
-						return await handlePaymentIntentFailure(
-							ctx,
-							event.data.object as StripePaymentIntent,
-						);
+						return await handlePaymentIntentFailure(ctx, event.data.object as StripePaymentIntent);
 					case "checkout.session.completed":
 						return await handleCheckoutSessionCompleted(
 							ctx,
@@ -637,18 +682,12 @@ export const webhookRoutes = {
 							event.data.object as StripeCheckoutSession,
 						);
 					case "charge.refunded":
-						return await handleChargeRefunded(
-							ctx,
-							event.data.object as StripeCharge,
-						);
+						return await handleChargeRefunded(ctx, event.data.object as StripeCharge);
 					case "customer.subscription.created":
 					case "customer.subscription.updated":
 					case "customer.subscription.resumed":
 					case "customer.subscription.paused":
-						await upsertFromStripe(
-							ctx,
-							event.data.object as StripeSubscription,
-						);
+						await upsertFromStripe(ctx, event.data.object as StripeSubscription);
 						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
 							headers: { "Content-Type": "application/json" },
@@ -672,19 +711,13 @@ export const webhookRoutes = {
 					case "invoice.payment_succeeded":
 					case "invoice.paid": {
 						const stripeInvoice = event.data.object as StripeInvoice;
-						const invoiceRecord = await upsertInvoiceFromStripe(
-							ctx,
-							stripeInvoice,
-						);
+						const invoiceRecord = await upsertInvoiceFromStripe(ctx, stripeInvoice);
 						// Renewal email on cycle invoices only. The initial
 						// period is covered by the order receipt issued at
 						// checkout, so we skip `subscription_create` /
 						// `subscription` to avoid a duplicate on the very
 						// first paid period.
-						if (
-							invoiceRecord &&
-							stripeInvoice.billing_reason === "subscription_cycle"
-						) {
+						if (invoiceRecord && stripeInvoice.billing_reason === "subscription_cycle") {
 							await sendSubscriptionRenewedEmail(ctx, invoiceRecord);
 						}
 						return new Response(JSON.stringify({ received: true }), {
@@ -693,34 +726,22 @@ export const webhookRoutes = {
 						});
 					}
 					case "invoice.payment_failed":
-						await handleInvoicePaymentFailed(
-							ctx,
-							event.data.object as StripeInvoice,
-						);
+						await handleInvoicePaymentFailed(ctx, event.data.object as StripeInvoice);
 						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
 							headers: { "Content-Type": "application/json" },
 						});
 					case "account.updated": {
 						const account = event.data.object as StripeAccount;
-						const previous =
-							await findVendorByStripeAccountId(ctx, account.id);
+						const previous = await findVendorByStripeAccountId(ctx, account.id);
 						const wasActive =
-							previous?.onboardingStatus === "active" &&
-							previous.chargesEnabled === true;
-						const vendor = await upsertVendorFromStripeAccount(
-							ctx,
-							account,
-						);
+							previous?.onboardingStatus === "active" && previous.chargesEnabled === true;
+						const vendor = await upsertVendorFromStripeAccount(ctx, account);
 						// Activation edge: chargesEnabled flipped false→true.
 						// Email is idempotent via a KV marker inside the send
 						// helper, so even webhook retries won't dupe.
 						if (vendor && !wasActive && vendor.chargesEnabled) {
-							await sendVendorActivated(
-								ctx,
-								vendor,
-								ctx.url("/vendor/dashboard"),
-							);
+							await sendVendorActivated(ctx, vendor, ctx.url("/vendor/dashboard"));
 						}
 						return new Response(JSON.stringify({ received: true }), {
 							status: 200,
@@ -742,23 +763,11 @@ export const webhookRoutes = {
 								headers: { "Content-Type": "application/json" },
 							});
 						}
-						const payoutRecord = await recordPayoutFromStripe(
-							ctx,
-							acctRaw,
-							payout,
-						);
+						const payoutRecord = await recordPayoutFromStripe(ctx, acctRaw, payout);
 						if (payoutRecord && event.type === "payout.paid") {
-							const vendor = await findVendorByStripeAccountId(
-								ctx,
-								acctRaw,
-							);
+							const vendor = await findVendorByStripeAccountId(ctx, acctRaw);
 							if (vendor) {
-								await sendVendorPayout(
-									ctx,
-									vendor,
-									payoutRecord,
-									ctx.url("/vendor/dashboard"),
-								);
+								await sendVendorPayout(ctx, vendor, payoutRecord, ctx.url("/vendor/dashboard"));
 							}
 						}
 						return new Response(JSON.stringify({ received: true }), {

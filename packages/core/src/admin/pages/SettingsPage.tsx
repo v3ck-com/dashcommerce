@@ -30,7 +30,7 @@ import {
 } from "../kit";
 import type { CheckoutMode, TaxMode } from "../../settings/schema";
 
-type Group = "store" | "reviews" | "downloads" | "marketing" | "connect" | "stripe";
+type Group = "store" | "payments" | "reviews" | "downloads" | "marketing" | "connect" | "stripe";
 
 interface GroupSpec {
 	id: Group;
@@ -42,8 +42,13 @@ const GROUPS: GroupSpec[] = [
 	{
 		id: "store",
 		title: "Store",
+		description: "Currency defaults. Only codes listed as enabled can be used at checkout.",
+	},
+	{
+		id: "payments",
+		title: "Payment provider",
 		description:
-			"Currency defaults. Only codes listed as enabled can be used at checkout.",
+			"Paystack is test-mode only. No live Paystack payments, automatic fulfilment or email delivery are enabled.",
 	},
 	{
 		id: "stripe",
@@ -91,6 +96,8 @@ interface SettingsShape {
 	connectPlatformFeePercent: number | null;
 	// Secrets are never sent down (server omits them), but the draft
 	// accepts strings when the operator types a new value to commit.
+	paymentProvider: "stripe" | "paystack-test" | null;
+	paystackSecretKey: string | null;
 	stripeSecretKey: string | null;
 	stripePublishableKey: string | null;
 	stripeWebhookSecret: string | null;
@@ -184,10 +191,7 @@ export function SettingsPage() {
 					| undefined;
 				if (body?.errors) {
 					setErrors(body.errors);
-					toast.error(
-						"Some fields need attention",
-						"Review the highlighted inputs.",
-					);
+					toast.error("Some fields need attention", "Review the highlighted inputs.");
 					return;
 				}
 				if (body?.error) {
@@ -195,10 +199,7 @@ export function SettingsPage() {
 					return;
 				}
 			}
-			toast.error(
-				"Save failed",
-				err instanceof Error ? err.message : "Unknown error",
-			);
+			toast.error("Save failed", err instanceof Error ? err.message : "Unknown error");
 		} finally {
 			setSaving(false);
 		}
@@ -225,24 +226,17 @@ export function SettingsPage() {
 	if (!saved) return <Loading />;
 
 	const connectEnabled = !!effective("connectEnabled");
-	const enabledCurrencies =
-		(effective("enabledCurrencies") as string[] | null | undefined) ?? [];
+	const enabledCurrencies = (effective("enabledCurrencies") as string[] | null | undefined) ?? [];
 
 	const needsStripeKey = !saved._secrets?.stripeSecretKey?.isSet;
 
 	return (
-		<div
-			style={{ display: "flex", flexDirection: "column", gap: 16, paddingBottom: 80 }}
-		>
+		<div style={{ display: "flex", flexDirection: "column", gap: 16, paddingBottom: 80 }}>
 			{needsStripeKey && (
 				<Alert type="warning" title="Finish setup">
-					Add a Stripe secret key below to start accepting payments. Test keys
-					start with <code>sk_test_</code>. Grab them at{" "}
-					<a
-						href="https://dashboard.stripe.com/test/apikeys"
-						target="_blank"
-						rel="noreferrer"
-					>
+					Add a Stripe secret key below to start accepting payments. Test keys start with{" "}
+					<code>sk_test_</code>. Grab them at{" "}
+					<a href="https://dashboard.stripe.com/test/apikeys" target="_blank" rel="noreferrer">
 						dashboard.stripe.com/test/apikeys
 					</a>
 					.
@@ -250,8 +244,8 @@ export function SettingsPage() {
 			)}
 
 			<Alert type="info" title="Tax settings live in Tax">
-				Tax mode and rates are configured on the dedicated Tax page to keep
-				flat-rate, table, and Stripe Tax controls in one place.
+				Tax mode and rates are configured on the dedicated Tax page to keep flat-rate, table, and
+				Stripe Tax controls in one place.
 			</Alert>
 
 			{GROUPS.map((group) => (
@@ -362,6 +356,40 @@ function GroupBody({
 		);
 	}
 
+	if (group === "payments") {
+		return (
+			<>
+				<FormField
+					label="Provider"
+					error={errors.paymentProvider}
+					description="Paystack requires ZAR prices, hosted checkout and a test secret. Coupons, subscriptions, Connect and advanced tax modes are not supported by the test integration."
+				>
+					<Select
+						value={eff("paymentProvider", saved, draft) ?? "stripe"}
+						options={[
+							{ value: "stripe", label: "Stripe" },
+							{ value: "paystack-test", label: "Paystack — test mode only" },
+						]}
+						onChange={(e) => {
+							setField("paymentProvider", e.currentTarget.value as "stripe" | "paystack-test");
+						}}
+						disabled={disabled}
+					/>
+				</FormField>
+				<SecretField
+					keyName="paystackSecretKey"
+					label="Paystack test secret key"
+					description="sk_test_ only. Also used to verify Paystack webhook signatures. Stored encrypted by EmDash; configure EMDASH_ENCRYPTION_KEY first."
+					saved={saved}
+					draft={draft}
+					errors={errors}
+					setField={setField}
+					disabled={disabled}
+				/>
+			</>
+		);
+	}
+
 	if (group === "stripe") {
 		const pkValue = (eff("stripePublishableKey", saved, draft) as string | null) ?? "";
 		const checkoutModeValue =
@@ -379,9 +407,7 @@ function GroupBody({
 							{ value: "hosted", label: "Hosted by Stripe (recommended)" },
 							{ value: "embedded", label: "Embedded (Stripe Elements on-site)" },
 						]}
-						onChange={(e) =>
-							setField("checkoutMode", e.currentTarget.value as CheckoutMode)
-						}
+						onChange={(e) => setField("checkoutMode", e.currentTarget.value as CheckoutMode)}
 						disabled={disabled}
 					/>
 				</FormField>
@@ -593,7 +619,7 @@ function SecretField({
 	setField,
 	disabled,
 }: {
-	keyName: "stripeSecretKey" | "stripeWebhookSecret";
+	keyName: "stripeSecretKey" | "stripeWebhookSecret" | "paystackSecretKey";
 	label: string;
 	description?: string;
 	saved: SettingsShape;
@@ -608,9 +634,7 @@ function SecretField({
 		<FormField
 			label={label}
 			description={
-				meta?.isSet
-					? `Leave blank to keep current (${meta.hint ?? "set"}).`
-					: description
+				meta?.isSet ? `Leave blank to keep current (${meta.hint ?? "set"}).` : description
 			}
 			error={errors[keyName]}
 		>
@@ -719,18 +743,10 @@ function StickyBar({
 						: "All changes saved"}
 			</span>
 			<div style={{ display: "flex", gap: 8 }}>
-				<Button
-					variant="secondary"
-					onClick={onDiscard}
-					disabled={!isDirty || saving}
-				>
+				<Button variant="secondary" onClick={onDiscard} disabled={!isDirty || saving}>
 					Discard
 				</Button>
-				<Button
-					variant="primary"
-					onClick={onSave}
-					disabled={!isDirty || saving}
-				>
+				<Button variant="primary" onClick={onSave} disabled={!isDirty || saving}>
 					{saving ? "Saving…" : "Save all"}
 				</Button>
 			</div>

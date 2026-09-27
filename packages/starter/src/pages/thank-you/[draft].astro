@@ -3,10 +3,13 @@ import Shop from "../../layouts/Shop.astro";
 import OrderSummary from "@dashcommerce/core/astro/components/OrderSummary.astro";
 
 export const prerender = false;
+Astro.response.headers.set("Cache-Control", "private, no-store");
+Astro.response.headers.set("Referrer-Policy", "no-referrer");
+Astro.response.headers.set("X-Robots-Tag", "noindex, nofollow");
 
 const { draft } = Astro.params;
 ---
-<Shop title="Thank you">
+<Shop title="Order status">
 	<OrderSummary orderDraftId={draft ?? ""} />
 	<p style="text-align: center; margin-top: 2rem;">
 		<a href="/shop">← Back to shop</a>

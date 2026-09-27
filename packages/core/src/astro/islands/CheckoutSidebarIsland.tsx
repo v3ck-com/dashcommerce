@@ -20,6 +20,7 @@ interface CartLine {
 	quantity: number;
 	unitPrice: Money;
 	lineSubtotal: Money;
+	customisation?: Record<string, string>;
 }
 interface ShippingMethod {
 	id: string;
@@ -40,6 +41,11 @@ interface CartState {
 
 const API = "/_emdash/api/plugins/dashcommerce";
 
+function optionLabel(key: string) {
+	const spaced = key.replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2");
+	return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
 function formatMoney(m: Money | null | undefined, locale = "en-US") {
 	if (!m) return "—";
 	try {
@@ -56,9 +62,7 @@ export interface CheckoutSidebarIslandProps {
 	locale?: string;
 }
 
-export default function CheckoutSidebarIsland({
-	locale = "en-US",
-}: CheckoutSidebarIslandProps) {
+export default function CheckoutSidebarIsland({ locale = "en-US" }: CheckoutSidebarIslandProps) {
 	const [cart, setCart] = useState<CartState | null>(null);
 	const [methods, setMethods] = useState<ShippingMethod[]>([]);
 	const [error, setError] = useState<string | null>(null);
@@ -138,15 +142,28 @@ export default function CheckoutSidebarIsland({
 	return (
 		<aside className="dc-checkout-sidebar" aria-label="Order summary">
 			<h3>Order summary</h3>
-			{error && <p role="alert" className="dc-sidebar-error">{error}</p>}
+			{error && (
+				<p role="alert" className="dc-sidebar-error">
+					{error}
+				</p>
+			)}
 			<ul className="dc-sidebar-items">
 				{cart.items.map((it) => (
 					<li key={it.lineId}>
 						<span className="dc-sidebar-qty">{it.quantity}×</span>{" "}
-						<span className="dc-sidebar-title">{it.title}</span>
-						<span className="dc-sidebar-total">
-							{formatMoney(it.lineSubtotal, locale)}
+						<span className="dc-sidebar-title">
+							{it.title}
+							{it.customisation && Object.keys(it.customisation).length > 0 && (
+								<small className="dc-sidebar-options">
+									{Object.entries(it.customisation).map(([key, value]) => (
+										<span key={key}>
+											<b>{optionLabel(key)}:</b> {value}
+										</span>
+									))}
+								</small>
+							)}
 						</span>
+						<span className="dc-sidebar-total">{formatMoney(it.lineSubtotal, locale)}</span>
 					</li>
 				))}
 			</ul>
@@ -166,9 +183,7 @@ export default function CheckoutSidebarIsland({
 										disabled={pending}
 									/>{" "}
 									<span>{m.label}</span>
-									<span className="dc-sidebar-method-amt">
-										{formatMoney(m.amount, locale)}
-									</span>
+									<span className="dc-sidebar-method-amt">{formatMoney(m.amount, locale)}</span>
 								</label>
 							</li>
 						))}
@@ -222,6 +237,8 @@ export default function CheckoutSidebarIsland({
 				.dc-sidebar-items li { display: grid; grid-template-columns: auto 1fr auto; gap: 0.5rem; padding: 0.25rem 0; color: var(--text, #111); }
 				.dc-sidebar-qty { color: var(--text-muted, #666); }
 				.dc-sidebar-title { color: var(--text, #111); }
+				.dc-sidebar-options { display: grid; gap: 0.1rem; margin-top: 0.2rem; color: var(--text-muted, #666); overflow-wrap: anywhere; }
+				.dc-sidebar-options b { font-weight: 600; }
 				.dc-sidebar-total { color: var(--text, #111); font-variant-numeric: tabular-nums; }
 				.dc-sidebar-shipping ul { list-style: none; padding: 0; margin: 0; font-size: 0.9em; }
 				.dc-sidebar-shipping li { padding: 0.25rem 0; }

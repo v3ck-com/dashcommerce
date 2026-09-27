@@ -28,6 +28,7 @@ interface CartLine {
 	unitPrice: Money;
 	lineSubtotal: Money;
 	title: string;
+	customisation?: Record<string, string>;
 }
 
 interface CartState {
@@ -35,6 +36,11 @@ interface CartState {
 	subtotal: Money;
 	total: Money;
 	currency: string;
+}
+
+function optionLabel(key: string) {
+	const spaced = key.replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2");
+	return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
 function formatMoney(m: Money, locale = "en-US") {
@@ -80,14 +86,11 @@ export default function CartDrawerIsland({
 		reload();
 		const onUpdate = (e: Event) => {
 			reload();
-			const silent = Boolean(
-				(e as CustomEvent<{ silent?: boolean } | undefined>).detail?.silent,
-			);
+			const silent = Boolean((e as CustomEvent<{ silent?: boolean } | undefined>).detail?.silent);
 			if (!silent) setOpen(true);
 		};
 		window.addEventListener("dashcommerce:cart-updated", onUpdate);
-		return () =>
-			window.removeEventListener("dashcommerce:cart-updated", onUpdate);
+		return () => window.removeEventListener("dashcommerce:cart-updated", onUpdate);
 	}, [reload]);
 
 	async function applyCart(next: CartState | null) {
@@ -100,15 +103,12 @@ export default function CartDrawerIsland({
 		setPending(true);
 		setError(null);
 		try {
-			const res = await fetch(
-				`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`,
-				{
-					method: "PATCH",
-					credentials: "include",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ quantity }),
-				},
-			);
+			const res = await fetch(`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`, {
+				method: "PATCH",
+				credentials: "include",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ quantity }),
+			});
 			const body = (await res.json().catch(() => ({}))) as {
 				cart?: CartState;
 				error?: string;
@@ -129,10 +129,10 @@ export default function CartDrawerIsland({
 		setPending(true);
 		setError(null);
 		try {
-			const res = await fetch(
-				`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`,
-				{ method: "DELETE", credentials: "include" },
-			);
+			const res = await fetch(`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`, {
+				method: "DELETE",
+				credentials: "include",
+			});
 			const body = (await res.json().catch(() => ({}))) as {
 				cart?: CartState;
 				error?: string;
@@ -150,9 +150,7 @@ export default function CartDrawerIsland({
 	}
 
 	async function clearCart() {
-		const confirmed = window.confirm(
-			"Remove everything from your cart?",
-		);
+		const confirmed = window.confirm("Remove everything from your cart?");
 		if (!confirmed) return;
 		setPending(true);
 		setError(null);
@@ -193,11 +191,7 @@ export default function CartDrawerIsland({
 				<aside className="dc-cart-drawer" aria-label="Shopping cart">
 					<header>
 						<h3>Cart</h3>
-						<button
-							type="button"
-							onClick={() => setOpen(false)}
-							aria-label="Close"
-						>
+						<button type="button" onClick={() => setOpen(false)} aria-label="Close">
 							×
 						</button>
 					</header>
@@ -215,10 +209,18 @@ export default function CartDrawerIsland({
 									<li key={it.lineId}>
 										<div className="dc-line-top">
 											<span className="dc-line-title">{it.title}</span>
-											<span className="dc-line-total">
-												{formatMoney(it.lineSubtotal)}
-											</span>
+											<span className="dc-line-total">{formatMoney(it.lineSubtotal)}</span>
 										</div>
+										{it.customisation && Object.keys(it.customisation).length > 0 && (
+											<dl className="dc-line-options">
+												{Object.entries(it.customisation).map(([key, value]) => (
+													<div key={key}>
+														<dt>{optionLabel(key)}</dt>
+														<dd>{value}</dd>
+													</div>
+												))}
+											</dl>
+										)}
 										<div className="dc-line-bottom">
 											<div
 												className="dc-qty-controls"
@@ -286,11 +288,7 @@ export default function CartDrawerIsland({
 					) : (
 						<div className="dc-cart-drawer-empty">
 							<p>Your cart is empty.</p>
-							<a
-								href="/shop"
-								className="dc-checkout-button"
-								onClick={() => setOpen(false)}
-							>
+							<a href="/shop" className="dc-checkout-button" onClick={() => setOpen(false)}>
 								Continue shopping
 							</a>
 						</div>
@@ -378,6 +376,11 @@ export default function CartDrawerIsland({
           white-space: nowrap;
           font-weight: 600;
         }
+        .dc-line-options { margin: 0.3rem 0; color: var(--text-muted, #666); font-size: 0.78rem; }
+        .dc-line-options div { display: flex; gap: 0.3rem; overflow-wrap: anywhere; }
+        .dc-line-options dt { font-weight: 600; }
+        .dc-line-options dt::after { content: ":"; }
+        .dc-line-options dd { margin: 0; }
         .dc-line-bottom {
           display: flex;
           align-items: center;

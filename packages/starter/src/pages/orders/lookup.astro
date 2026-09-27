@@ -5,9 +5,8 @@ import Shop from "../../layouts/Shop.astro";
 	<div class="container-narrow" style="padding: 3rem 0;">
 		<h1>Look up an order</h1>
 		<p class="lead">
-			Your confirmation email contains a link to your receipt —
-			<code>/thank-you/&lt;orderId&gt;</code>. Paste the ID (or the whole link)
-			below.
+			Paste the private order reference or receipt link you saved after checkout.
+			Paystack test checkouts do not send receipt emails.
 		</p>
 
 		<form id="lookup" class="lookup-form" novalidate>
@@ -25,9 +24,7 @@ import Shop from "../../layouts/Shop.astro";
 		</form>
 
 		<p class="fineprint">
-			Can't find the email? Check spam, or
-			<a href="mailto:support">contact support</a> with the email address and
-			approximate date you placed the order.
+			Treat this reference like a private receipt link. If it is lost, use the shop's published support channel.
 		</p>
 	</div>
 </Shop>
@@ -99,7 +96,7 @@ import Shop from "../../layouts/Shop.astro";
 		setErr(null);
 		const id = extractId(input?.value ?? "");
 		if (!id) {
-			setErr("That doesn't look like an order ID. Check your receipt email.");
+			setErr("That doesn't look like an order reference or receipt link.");
 			return;
 		}
 		window.location.href = `/thank-you/${encodeURIComponent(id)}`;

@@ -96,10 +96,7 @@ async function nextOrderNumber(ctx: PluginContext): Promise<string> {
  * unique-index conflict. Max 8 retries is plenty — conflict storms
  * converge within log-n rounds.
  */
-async function putOrderWithUniqueNumber(
-	ctx: PluginContext,
-	order: Order,
-): Promise<Order> {
+async function putOrderWithUniqueNumber(ctx: PluginContext, order: Order): Promise<Order> {
 	let candidate = order;
 	const MAX_RETRIES = 8;
 	for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
@@ -168,8 +165,7 @@ async function upsertCustomer(
 			ordersCount: prev.ordersCount + 1,
 			totalSpent: {
 				...prev.totalSpent,
-				[input.currency]:
-					(prev.totalSpent[input.currency] ?? 0) + input.orderTotalMinor,
+				[input.currency]: (prev.totalSpent[input.currency] ?? 0) + input.orderTotalMinor,
 			},
 			updatedAt: now,
 		};
@@ -285,9 +281,7 @@ export async function createOrderFromPaymentIntent(
 	}
 
 	if (!cart.billingAddress || !cart.shippingAddress) {
-		throw new Error(
-			"Cart snapshot is missing billing or shipping address — cannot create order.",
-		);
+		throw new Error("Cart snapshot is missing billing or shipping address — cannot create order.");
 	}
 
 	const customerEmail = cart.customerEmail ?? pi.receipt_email ?? cart.billingAddress.firstName;
@@ -320,6 +314,7 @@ export async function createOrderFromPaymentIntent(
 			...(line.variantId ? { variantId: line.variantId } : {}),
 			sku: "",
 			name: line.title,
+			...(line.customisation ? { customisation: line.customisation } : {}),
 			quantity: line.quantity,
 			unitPrice: line.unitPrice,
 			lineSubtotal: line.lineSubtotal,
@@ -328,9 +323,7 @@ export async function createOrderFromPaymentIntent(
 			total: line.lineSubtotal,
 			isDigital: line.isDigital,
 			...(line.vendorId ? { vendorId: line.vendorId } : {}),
-			...(line.subscriptionConfig
-				? { subscriptionConfig: line.subscriptionConfig }
-				: {}),
+			...(line.subscriptionConfig ? { subscriptionConfig: line.subscriptionConfig } : {}),
 		};
 		return lineItem;
 	});
@@ -372,9 +365,7 @@ export async function createOrderFromPaymentIntent(
 	// downstream code (stock, coupon usage, lock release, email) sees
 	// the number that actually landed on disk.
 	Object.assign(order, persistedOrder);
-	await orderItemsStore(ctx).putMany(
-		items.map((it) => ({ id: it.id, data: it })),
-	);
+	await orderItemsStore(ctx).putMany(items.map((it) => ({ id: it.id, data: it })));
 
 	// (5) Decrement stock + write ledger per line.
 	// Errors here are LOUD — the order is persisted but stock invariants
@@ -456,10 +447,7 @@ export async function loadOrder(ctx: PluginContext, orderId: string): Promise<Or
 	return { ...(raw as Order), id: orderId };
 }
 
-export async function loadOrderItems(
-	ctx: PluginContext,
-	orderId: string,
-): Promise<OrderItem[]> {
+export async function loadOrderItems(ctx: PluginContext, orderId: string): Promise<OrderItem[]> {
 	const result = await orderItemsStore(ctx).query({ where: { orderId }, limit: 200 });
 	return result.items.map((r) => ({ ...(r.data as OrderItem), id: r.id }));
 }

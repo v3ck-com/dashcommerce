@@ -8,12 +8,7 @@
  * `POST /cart/coupon`, `DELETE /cart/coupon/remove?code={code}`.
  */
 
-import {
-	useCallback,
-	useEffect,
-	useState,
-	type FormEvent,
-} from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 
 interface Money {
 	currency: string;
@@ -28,6 +23,7 @@ interface CartLine {
 	unitPrice: Money;
 	lineSubtotal: Money;
 	title: string;
+	customisation?: Record<string, string>;
 }
 
 interface AppliedCoupon {
@@ -45,6 +41,11 @@ interface CartState {
 	taxTotal: Money;
 	total: Money;
 	currency: string;
+}
+
+function optionLabel(key: string) {
+	const spaced = key.replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2");
+	return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
 function formatMoney(m: Money | null | undefined, locale = "en-US") {
@@ -106,15 +107,12 @@ export default function CartPageIsland({
 		setPending(true);
 		setError(null);
 		try {
-			const res = await fetch(
-				`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`,
-				{
-					method: "PATCH",
-					credentials: "include",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ quantity }),
-				},
-			);
+			const res = await fetch(`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`, {
+				method: "PATCH",
+				credentials: "include",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ quantity }),
+			});
 			if (!res.ok) {
 				const body = (await res.json().catch(() => ({}))) as { error?: string };
 				setError(body.error ?? `Update failed (${res.status})`);
@@ -133,10 +131,10 @@ export default function CartPageIsland({
 		setPending(true);
 		setError(null);
 		try {
-			const res = await fetch(
-				`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`,
-				{ method: "DELETE", credentials: "include" },
-			);
+			const res = await fetch(`${API}/cart/item?lineId=${encodeURIComponent(lineId)}`, {
+				method: "DELETE",
+				credentials: "include",
+			});
 			if (!res.ok) {
 				const body = (await res.json().catch(() => ({}))) as { error?: string };
 				setError(body.error ?? `Remove failed (${res.status})`);
@@ -209,10 +207,10 @@ export default function CartPageIsland({
 		setPending(true);
 		setCouponError(null);
 		try {
-			const res = await fetch(
-				`${API}/cart/coupon/remove?code=${encodeURIComponent(code)}`,
-				{ method: "DELETE", credentials: "include" },
-			);
+			const res = await fetch(`${API}/cart/coupon/remove?code=${encodeURIComponent(code)}`, {
+				method: "DELETE",
+				credentials: "include",
+			});
 			if (!res.ok) {
 				const body = (await res.json().catch(() => ({}))) as { error?: string };
 				setCouponError(body.error ?? `Remove failed (${res.status})`);
@@ -256,10 +254,18 @@ export default function CartPageIsland({
 			<table className="dc-cart-table">
 				<thead>
 					<tr>
-						<th scope="col" className="dc-th-item">Item</th>
-						<th scope="col" className="dc-th-qty">Qty</th>
-						<th scope="col" className="dc-th-total">Line total</th>
-						<th scope="col"><span className="dc-sr-only">Remove</span></th>
+						<th scope="col" className="dc-th-item">
+							Item
+						</th>
+						<th scope="col" className="dc-th-qty">
+							Qty
+						</th>
+						<th scope="col" className="dc-th-total">
+							Line total
+						</th>
+						<th scope="col">
+							<span className="dc-sr-only">Remove</span>
+						</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -267,9 +273,17 @@ export default function CartPageIsland({
 						<tr key={it.lineId}>
 							<td>
 								<strong>{it.title}</strong>
-								<div className="dc-line-unit">
-									{formatMoney(it.unitPrice, locale)} each
-								</div>
+								{it.customisation && Object.keys(it.customisation).length > 0 && (
+									<dl className="dc-line-options">
+										{Object.entries(it.customisation).map(([key, value]) => (
+											<div key={key}>
+												<dt>{optionLabel(key)}</dt>
+												<dd>{value}</dd>
+											</div>
+										))}
+									</dl>
+								)}
+								<div className="dc-line-unit">{formatMoney(it.unitPrice, locale)} each</div>
 							</td>
 							<td>
 								<div className="dc-qty-controls">
@@ -302,9 +316,7 @@ export default function CartPageIsland({
 									</button>
 								</div>
 							</td>
-							<td className="dc-line-total">
-								{formatMoney(it.lineSubtotal, locale)}
-							</td>
+							<td className="dc-line-total">{formatMoney(it.lineSubtotal, locale)}</td>
 							<td>
 								<button
 									type="button"
@@ -328,9 +340,7 @@ export default function CartPageIsland({
 						{cart.coupons.map((c) => (
 							<li key={c.code}>
 								<code>{c.code}</code>{" "}
-								{c.freeShipping
-									? "(free shipping)"
-									: `−${formatMoney(c.discountAmount, locale)}`}
+								{c.freeShipping ? "(free shipping)" : `−${formatMoney(c.discountAmount, locale)}`}
 								<button
 									type="button"
 									onClick={() => removeCoupon(c.code)}
@@ -396,12 +406,7 @@ export default function CartPageIsland({
 
 			<div className="dc-cart-actions">
 				<a href={shopHref}>← Continue shopping</a>
-				<button
-					type="button"
-					className="dc-clear-all"
-					onClick={clearCart}
-					disabled={pending}
-				>
+				<button type="button" className="dc-clear-all" onClick={clearCart} disabled={pending}>
 					Clear cart
 				</button>
 				<a href={checkoutHref} className="dc-btn-primary">
@@ -417,6 +422,11 @@ export default function CartPageIsland({
 				.dc-cart-table th { text-align: left; padding: 0.75rem 0; border-bottom: 1px solid var(--border-mid, #e4e4e7); color: var(--text-muted, #555); font-weight: 600; font-size: 0.85em; }
 				.dc-cart-table td { padding: 0.75rem 0; border-bottom: 1px solid var(--border, #f4f4f5); vertical-align: middle; color: var(--text, #111); }
 				.dc-th-qty, .dc-th-total { text-align: right; }
+				.dc-line-options { margin: 0.35rem 0 0; color: var(--text-muted, #666); font-size: 0.85em; }
+				.dc-line-options div { display: flex; gap: 0.35rem; overflow-wrap: anywhere; }
+				.dc-line-options dt { font-weight: 600; }
+				.dc-line-options dt::after { content: ":"; }
+				.dc-line-options dd { margin: 0; }
 				.dc-line-unit { color: var(--text-muted, #666); font-size: 0.85em; margin-top: 0.25rem; }
 				.dc-qty-controls { display: inline-flex; align-items: center; gap: 0.25rem; }
 				.dc-qty-controls button {

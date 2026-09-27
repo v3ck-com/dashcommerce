@@ -7,9 +7,16 @@ import HostedCheckoutForm from "@dashcommerce/core/astro/components/HostedChecko
 
 export const prerender = false;
 
+const paymentProviderSetting = (await getPluginSetting("dashcommerce", "paymentProvider")) as string | null | undefined;
+const paymentProvider = paymentProviderSetting ?? "stripe";
+const isStripe = paymentProvider === "stripe";
+const isPaystackTest = paymentProvider === "paystack-test";
+const supportedProvider = isStripe || isPaystackTest;
+
 const publishableKey = (await getPluginSetting("dashcommerce", "stripePublishableKey")) as string | null | undefined;
-const secretKey      = (await getPluginSetting("dashcommerce", "stripeSecretKey"))      as string | null | undefined;
-const webhookSecret  = (await getPluginSetting("dashcommerce", "stripeWebhookSecret"))  as string | null | undefined;
+const secretKey = (await getPluginSetting("dashcommerce", "stripeSecretKey")) as string | null | undefined;
+const webhookSecret = (await getPluginSetting("dashcommerce", "stripeWebhookSecret")) as string | null | undefined;
+const paystackSecretKey = (await getPluginSetting("dashcommerce", "paystackSecretKey")) as string | null | undefined;
 // `checkoutMode` controls whether we redirect to Stripe's hosted page
 // (default — lower PCI scope, simpler UI) or render Stripe Elements
 // on-site. Publishable key is only required for the embedded flow.
@@ -21,11 +28,17 @@ const checkoutModeSetting = (await getPluginSetting("dashcommerce", "checkoutMod
 const checkoutMode: "hosted" | "embedded" = checkoutModeSetting ?? "hosted";
 
 const missingKeys: string[] = [];
-if (!secretKey)                                   missingKeys.push("stripeSecretKey");
-if (checkoutMode === "embedded" && !publishableKey) missingKeys.push("stripePublishableKey");
-if (!webhookSecret)                                missingKeys.push("stripeWebhookSecret");
+if (isStripe) {
+  if (!secretKey) missingKeys.push("stripeSecretKey");
+  if (checkoutMode === "embedded" && !publishableKey) missingKeys.push("stripePublishableKey");
+  if (!webhookSecret) missingKeys.push("stripeWebhookSecret");
+}
+if (isPaystackTest) {
+  if (!paystackSecretKey?.startsWith("sk_test_")) missingKeys.push("paystackSecretKey (test key)");
+}
 
-const canCheckout = missingKeys.length === 0;
+const canCheckout = supportedProvider && missingKeys.length === 0;
+const hostedCheckout = isPaystackTest || checkoutMode === "hosted";
 
 // Show a "payment canceled" banner when the customer hit Stripe's back
 // button and landed back here (`success_url`/`cancel_url` on the
@@ -48,7 +61,7 @@ const canceled = Astro.url.searchParams.get("canceled") === "1";
       <h1 class="co-title">Checkout</h1>
       <p class="co-subtitle">
         <span class="co-secure-icon" aria-hidden="true">🔒</span>
-        Secure · Encrypted · Stripe-powered
+        {isPaystackTest ? "Paystack TEST mode · No real payment" : "Secure · Encrypted · Stripe-powered"}
       </p>
     </div>
   </div>
@@ -60,30 +73,27 @@ const canceled = Astro.url.searchParams.get("canceled") === "1";
 
       {!canCheckout && (
         <div class="co-misconfig" role="alert">
-          <strong>⚠ Stripe is not configured</strong>
-          <p>
-            The following settings are missing:
-            <code>{missingKeys.join(", ")}</code>.
-          </p>
-          <p>
-            Open <a href="/_emdash/admin/plugins/dashcommerce/settings">DashCommerce settings</a> to add them.
-            If using <code>stripe listen</code>, paste the <code>whsec_…</code> secret into <code>stripeWebhookSecret</code>.
-          </p>
+          <strong>Checkout is unavailable</strong>
+          {!supportedProvider ? (
+            <p>The configured payment provider is not supported. We will not fall back to another provider.</p>
+          ) : (
+            <p>Payment setup is incomplete. Please ask the shop operator to finish configuring {isPaystackTest ? "Paystack test mode" : "Stripe"}.</p>
+          )}
         </div>
       )}
 
-      {canceled && canCheckout && (
+      {canceled && canCheckout && isStripe && (
         <div class="co-canceled" role="status">
           <strong>Payment canceled.</strong>
           <p>No charge was made. You can restart the checkout below.</p>
         </div>
       )}
 
-      {canCheckout && checkoutMode === "hosted" && (
-        <HostedCheckoutForm />
+      {canCheckout && hostedCheckout && (
+        <HostedCheckoutForm paymentProvider={isPaystackTest ? "paystack-test" : "stripe"} />
       )}
 
-      {canCheckout && checkoutMode === "embedded" && (
+      {canCheckout && isStripe && checkoutMode === "embedded" && (
         <>
       <!-- Step 1: Contact & address -->
       <section id="contact-form" class="co-step">

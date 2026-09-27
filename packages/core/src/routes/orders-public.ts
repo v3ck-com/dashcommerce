@@ -23,6 +23,8 @@
 import type { PluginContext, RouteContext, StorageCollection } from "emdash";
 import type { Order, OrderItem } from "../types";
 import { draftKey } from "./checkout";
+import { attemptForDraft, reconcileAttempt, testKey } from "../payment-provider/paystack-test";
+import { finalizePaystackTest } from "../orders/paystack";
 
 type OrdersStore = StorageCollection<Order>;
 type OrderItemsStore = StorageCollection<OrderItem>;
@@ -38,7 +40,7 @@ function orderItemsStore(ctx: PluginContext): OrderItemsStore {
 function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { "Content-Type": "application/json" },
+		headers: { "Content-Type": "application/json", "Cache-Control": "private, no-store" },
 	});
 }
 
@@ -53,7 +55,7 @@ function parseDraftId(req: Request): string | null {
 	// helper robust for tests / future matchers.
 	const parts = url.pathname.split("/").filter(Boolean);
 	const idx = parts.lastIndexOf("by-draft");
-	return idx === -1 ? null : parts[idx + 1] ?? null;
+	return idx === -1 ? null : (parts[idx + 1] ?? null);
 }
 
 export const ordersPublicRoutes = {
@@ -62,8 +64,46 @@ export const ordersPublicRoutes = {
 		handler: async (routeCtx: RouteContext, _c?: PluginContext) => {
 			const ctx = (_c ?? (routeCtx as unknown as PluginContext)) as PluginContext;
 			const orderDraftId = parseDraftId(routeCtx.request);
-			if (!orderDraftId) return json({ error: "Missing orderDraftId" }, 400);
+			if (!orderDraftId || !/^[a-f0-9]{32}$/.test(orderDraftId))
+				return json({ error: "Invalid orderDraftId" }, 400);
 
+			// The draft id is a capability, never a provider-supplied redirect status.
+			const attempt = await attemptForDraft(ctx, orderDraftId);
+			if (attempt) {
+				let current = attempt;
+				try {
+					const key = await ctx.kv.get<string>("settings:paystackSecretKey");
+					testKey(key);
+					current = await reconcileAttempt(ctx, key, attempt);
+					if (current.outcome === "verified") {
+						const { order } = await finalizePaystackTest(ctx, current);
+						const items = (
+							await orderItemsStore(ctx).query({ where: { orderId: order.id }, limit: 100 })
+						).items.map((r) => ({ ...r.data, id: r.id }));
+						return json({
+							status: "ready",
+							order,
+							items,
+							testMode: true,
+							manualReview: order.metadata?.inventoryStatus === "manual_review",
+						});
+					}
+					return json({
+						status:
+							current.outcome === "failed"
+								? "failed"
+								: current.outcome === "manual_review"
+									? "manual_review"
+									: "pending",
+						testMode: true,
+					});
+				} catch (err) {
+					ctx.log.warn("Test payment verification/finalization deferred", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+					return json({ status: "pending", retryable: true, testMode: true });
+				}
+			}
 			// Query by metadata.orderDraftId — not a first-class index, so we
 			// scan the most recent 200 orders (enough for any realistic race
 			// window between Stripe confirm + webhook + page poll).
@@ -72,9 +112,7 @@ export const ordersPublicRoutes = {
 				limit: 200,
 			});
 			const match = recent.items.find((r) => {
-				const meta = (r.data as Order).metadata as
-					| { orderDraftId?: string }
-					| undefined;
+				const meta = (r.data as Order).metadata as { orderDraftId?: string } | undefined;
 				return meta?.orderDraftId === orderDraftId;
 			});
 			if (match) {

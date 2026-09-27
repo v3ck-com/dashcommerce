@@ -5,6 +5,7 @@ import sitemap from "@astrojs/sitemap";
 import { dashcommerce } from "@dashcommerce/core";
 import { d1, r2 } from "@emdash-cms/cloudflare";
 import { defineConfig, passthroughImageService } from "astro/config";
+import { emdash041Host } from "./src/host/emdash-041-host.mjs";
 import emdash, { local, s3 } from "emdash/astro";
 import { postgres, sqlite } from "emdash/db";
 
@@ -14,8 +15,7 @@ import { postgres, sqlite } from "emdash/db";
 //   - Cloudflare Workers: D1 binding + R2 binding, selected by DEPLOY_TARGET=cloudflare
 const target = process.env.DEPLOY_TARGET === "cloudflare" ? "cloudflare" : "node";
 
-const adapter =
-	target === "cloudflare" ? cloudflare() : node({ mode: "standalone" });
+const adapter = target === "cloudflare" ? cloudflare() : node({ mode: "standalone" });
 
 const database =
 	target === "cloudflare"
@@ -51,6 +51,7 @@ export default defineConfig({
 	},
 	integrations: [
 		react(),
+		emdash041Host(),
 		sitemap({
 			// Admin + post-checkout pages shouldn't be crawled.
 			filter: (page) =>
@@ -73,11 +74,8 @@ export default defineConfig({
 				// EmDash 0.37.0+ imports these conditionally, but Vite tries to bundle them
 				// during the build step, causing resolution errors. These are only available
 				// in the Cloudflare Workers runtime and should be treated as external.
-				external: target === "node" ? [
-					"cloudflare:sockets",
-					"cloudflare:email",
-					/^cloudflare:/,
-				] : [],
+				external:
+					target === "node" ? ["cloudflare:sockets", "cloudflare:email", /^cloudflare:/] : [],
 			},
 		},
 	},

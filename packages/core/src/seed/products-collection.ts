@@ -147,6 +147,12 @@ export function defineProductsCollection(
 			help: "Set a price in each currency your store accepts. Customers whose cart is set to an unpriced currency will not be able to add this product.",
 		},
 		{
+			slug: "customisation_definition",
+			label: "Personalisation (spike)",
+			type: "json",
+			help: 'Optional server-owned text-field schema, e.g. {"fields":[{"key":"name","maxLength":40,"required":true}]}. This spike does not implement paid options or imported ACOWebs forms.',
+		},
+		{
 			slug: "manage_stock",
 			label: "Track Inventory",
 			type: "boolean",

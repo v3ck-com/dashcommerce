@@ -43,12 +43,7 @@ export interface Address {
 // Product (host content collection rows)
 // ────────────────────────────────────────────────────────────────────────────
 
-export type ProductType =
-	| "simple"
-	| "variable"
-	| "grouped"
-	| "external"
-	| "subscription";
+export type ProductType = "simple" | "variable" | "grouped" | "external" | "subscription";
 
 export type StockStatus = "instock" | "outofstock" | "onbackorder";
 export type BackorderPolicy = "no" | "yes" | "notify";
@@ -108,7 +103,17 @@ export interface ProductFields {
 	// external
 	productUrl?: string;
 	buttonText?: string;
+	/** Optional server-authored product field (host collection JSON slug: customisation_definition). */
+	customisationDefinition?: CustomisationDefinition;
 }
+
+/** Spike-only text fields; migrating real product form definitions is out of scope. */
+export interface CustomisationDefinition {
+	fields: Array<{ key: string; maxLength: number; required?: boolean }>;
+}
+
+/** Validated customer text only; never contains prices or arbitrary metadata. */
+export type CustomisationOptions = Record<string, string>;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Product variants (plugin storage collection `product_variants`)
@@ -142,6 +147,7 @@ export interface CartLineItem {
 	lineSubtotal: Money;
 	title: string;
 	imageMediaId?: string;
+	customisation?: CustomisationOptions;
 	isDigital: boolean;
 	vendorId?: string;
 	subscriptionConfig?: SubscriptionConfig;
@@ -197,12 +203,7 @@ export type OrderStatus =
 	| "partially-refunded"
 	| "failed";
 
-export type PaymentStatus =
-	| "pending"
-	| "paid"
-	| "failed"
-	| "refunded"
-	| "partially-refunded";
+export type PaymentStatus = "pending" | "paid" | "failed" | "refunded" | "partially-refunded";
 
 export interface VendorSplit {
 	vendorId: string;
@@ -236,7 +237,9 @@ export interface Order {
 	couponCodes: string[];
 	vendorSplits?: VendorSplit[];
 	subscriptionIds?: string[];
-	stripePaymentIntentId: string; // unique
+	stripePaymentIntentId?: string; // Stripe orders only
+	paymentProvider?: "stripe" | "paystack-test";
+	paymentReference?: string; // unique provider-qualified transaction reference
 	stripeCustomerId?: string;
 	stripeChargeId?: string;
 	paymentMethodType?: string; // card, link, applepay, …
@@ -251,6 +254,20 @@ export interface Order {
 	cancelledAt?: IsoDateTime;
 }
 
+/** Provider-neutral payment claim; test payments remain separate from live receipts. */
+export interface PaymentRecord {
+	id: string;
+	paymentKey: string;
+	provider: "paystack-test";
+	orderDraftId: string;
+	amount: Money;
+	status: "verified_test" | "finalized_test";
+	inventoryStatus?: "consumed" | "not_required" | "manual_review";
+	inventoryReason?: string;
+	orderId: string;
+	verifiedAt: IsoDateTime;
+}
+
 export interface OrderItem {
 	id: string;
 	orderId: string;
@@ -259,6 +276,7 @@ export interface OrderItem {
 	sku: string;
 	name: string;
 	attributes?: Record<string, string>;
+	customisation?: CustomisationOptions;
 	quantity: number;
 	unitPrice: Money;
 	lineSubtotal: Money;
@@ -381,11 +399,7 @@ export interface ShippingZone {
 	updatedAt: IsoDateTime;
 }
 
-export type ShippingMethodType =
-	| "flat_rate"
-	| "free_shipping"
-	| "local_pickup"
-	| "weight_based";
+export type ShippingMethodType = "flat_rate" | "free_shipping" | "local_pickup" | "weight_based";
 
 export type ShippingMethodConfig =
 	| {

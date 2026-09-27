@@ -10,7 +10,8 @@
 import type { PluginDescriptor } from "emdash";
 
 import { DASHCOMMERCE_STORAGE } from "./storage-collections";
-import { detectEmDashVersionAtBuildTime } from "./version-check";
+import { checkEmDashVersion } from "./version-check";
+import { detectEmDashVersionAtBuildTime } from "./version-detect";
 
 export const DASHCOMMERCE_PLUGIN_ID = "dashcommerce";
 export const DASHCOMMERCE_VERSION = "0.2.0";
@@ -22,7 +23,7 @@ export interface DashCommerceOptions {
 	 * (each store gets its own scoped storage + KV namespace).
 	 */
 	id?: string;
-	
+
 	/**
 	 * EmDash version for runtime compatibility check.
 	 * Auto-detected at build time if not provided.
@@ -46,6 +47,12 @@ export interface DashCommerceOptions {
  */
 export function dashcommerce(options: DashCommerceOptions = {}): PluginDescriptor {
 	const id = options.id ?? DASHCOMMERCE_PLUGIN_ID;
+	if (id !== DASHCOMMERCE_PLUGIN_ID)
+		throw new Error("This spike's scoped host bridge supports only plugin id dashcommerce.");
+	const emdashVersion = options.emdashVersion ?? detectEmDashVersionAtBuildTime();
+	if (!emdashVersion)
+		throw new Error("Cannot detect installed EmDash version; refusing to assume compatibility.");
+	checkEmDashVersion(emdashVersion);
 
 	return {
 		id,
@@ -66,7 +73,7 @@ export function dashcommerce(options: DashCommerceOptions = {}): PluginDescripto
 			"network:request",
 			"email:send",
 		],
-		allowedHosts: ["api.stripe.com", "files.stripe.com"],
+		allowedHosts: ["api.stripe.com", "files.stripe.com", "api.paystack.co"],
 		storage: DASHCOMMERCE_STORAGE,
 		// Native React admin UI. Pages + widgets populated progressively in Phase 12.
 		adminEntry: "@dashcommerce/core/admin",
@@ -166,6 +173,7 @@ export function dashcommerce(options: DashCommerceOptions = {}): PluginDescripto
 		options: {
 			id,
 			version: DASHCOMMERCE_VERSION,
+			emdashVersion,
 			capabilities: [
 				"content:read",
 				"content:write",
@@ -174,7 +182,7 @@ export function dashcommerce(options: DashCommerceOptions = {}): PluginDescripto
 				"network:request",
 				"email:send",
 			],
-			allowedHosts: ["api.stripe.com", "files.stripe.com"],
+			allowedHosts: ["api.stripe.com", "files.stripe.com", "api.paystack.co"],
 		},
 	} as PluginDescriptor;
 }
