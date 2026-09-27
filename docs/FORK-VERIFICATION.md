@@ -1,19 +1,25 @@
-# Initial fork verification — 2026-09-27
+# Fork verification — 2026-09-27
 
-Target: EmDash 0.41.0, Astro 7.3.5, standalone Node/SQLite, Bun 1.4.2.
+## Normal gateway implementation
 
-Local integrated results:
+Target: EmDash **0.41.0**, Astro **7.3.5**, standalone Node/SQLite, Bun **1.4.2**. Current integrated local run: **Node 26.8.1**. The CI matrix independently runs Node 22 and 24; inspect the checks attached to the candidate commit rather than treating a local result as CI evidence.
 
 - Frozen dependency installation: pass.
-- Core suite: **176 tests, 704 assertions, zero failures**.
+- Core suite: **302 tests, 1,290 assertions, zero failures**, across 30 files.
 - Workspace typecheck: pass; seven existing starter hints.
-- Core/starter builds: pass; bundle-size warning remains.
-- Trusted host middleware: **5 tests**, plus real native EmDash HTTP cookie/status/cache/HEAD checks.
-- Real HTTP payment lifecycle: pass on **Node 22, 24 and 26**. Covers retry identity, client-price rejection, provider-amount mismatch, concurrent webhook/return, exact-byte signatures, one durable order/payment/outbox, stock consumption, partial SQLite write failure, process restart and abandoned-payment release.
-- Chromium: **6 tests**. The principal journey uses real application cart/contact/shipping/checkout/verification/order endpoints and a physical personalised item. Provider page and provider/DNS HTTP are local fixtures. Includes HTML-shaped text escaping, pending/paid receipt, provider review, uncertain-initialization recovery, unsupported provider and legacy Stripe UI selection.
-- Production dependency audit: **zero known vulnerabilities**. The inherited Astro 6 dependency was upgraded after the audit identified critical/high advisories.
-- Staged privacy checks: no known private environment credentials, customer databases, runtime logs, workstation paths or infrastructure addresses.
+- Core/starter builds: pass; existing bundle-size warning remains.
+- Trusted host middleware: **5 tests**, plus native EmDash HTTP/SQLite cookie, cache, HEAD, status and method checks.
+- **8 integrated native HTTP scenarios:** authoritative proof and concurrent callbacks; interrupted order writes/restart; abandoned payment release; normal test/live tax/coupons/refunds and persisted mode; lost refund responses/operator recovery; stale stock preview rejection and refund-effect replay after an interrupted notification write; pre-initialization coupon capacity, confirmed-failure release and native coupon-code edits.
+- Chromium: **7 tests**, including a normal synthetic live-mode checkout and pending-to-completed refund journey. Principal flows use actual application endpoints; provider traffic/pages are intercepted. Additional UI-state tests intentionally stub authority responses.
+- Production dependency audit: **zero known vulnerabilities**, 655 packages checked.
+- Independent read-only source review: no actionable defect found in reviewed normal Paystack/shared order paths. The reviewer did not independently run the suites or certify provider behavior.
 
-Independent review findings about browser stock setup, initialization uncertainty, manual-review rendering and purchased-cart cleanup were resolved and followed by integrated reruns. Cleanup uses conditional deletion so a newer cart survives.
+Targeted regressions include separate inventory environments, immutable payment mode, interrupted finalization/refund effects, cumulative partial-restock limits, external refund correlation, indexed receipts beyond 200 orders, incomplete-payment refund rejection, coupon accounting/audit interruption, coupon edits racing accounting, code aliases, customer identity changes, lost coupon capacity/manual review, and retryable Stripe card declines versus terminal cancellation.
 
-These are development test results, **not a live-payment, real Paystack sandbox-account, production Stripe, Workers or PostgreSQL certification**. No real payment credentials, customer data, provider network calls, email delivery, deployment or existing-store migration were used. See the root README for operational limits and the GitHub CI workflow for clean-runner checks.
+These results do **not** certify actual Paystack sandbox-account behavior, real Stripe transactions, production email, Workers, PostgreSQL, deployment monitoring, restore/rollback or an existing-store migration. All financial/provider calls were synthetic and intercepted, including live-mode tests. No real financial credentials, customer data, charges, email delivery, deployment or DNS changes were used.
+
+## Previous published baseline
+
+The initial test-only fork (`f6df98c`) passed 176 core tests/704 assertions, five host tests and six browser tests, with HTTP checks on Node 22/24/26. Those results describe that earlier commit, not this larger normal-gateway implementation. The current integrated evidence above supersedes its feature/test counts.
+
+See [readiness](PRODUCTION-READINESS.md), [operator guidance](OPERATOR_CHECKLIST.md) and the [CI workflow](../.github/workflows/ci.yml). Source/fixture success remains distinct from provider acceptance and explicit go-live authorization.

@@ -1,44 +1,71 @@
 ---
-import { getPluginSetting } from "emdash";
-import Shop from "../layouts/Shop.astro";
 import CheckoutForm from "@dashcommerce/core/astro/components/CheckoutForm.astro";
 import CheckoutSidebar from "@dashcommerce/core/astro/components/CheckoutSidebar.astro";
 import HostedCheckoutForm from "@dashcommerce/core/astro/components/HostedCheckoutForm.astro";
+import { getPluginSetting } from "emdash";
+import Shop from "../layouts/Shop.astro";
 
 export const prerender = false;
 
-const paymentProviderSetting = (await getPluginSetting("dashcommerce", "paymentProvider")) as string | null | undefined;
+const paymentProviderSetting = (await getPluginSetting("dashcommerce", "paymentProvider")) as
+	| string
+	| null
+	| undefined;
 const paymentProvider = paymentProviderSetting ?? "stripe";
 const isStripe = paymentProvider === "stripe";
-const isPaystackTest = paymentProvider === "paystack-test";
-const supportedProvider = isStripe || isPaystackTest;
+const isPaystack = paymentProvider === "paystack" || paymentProvider === "paystack-test";
+const paystackModeSetting = (await getPluginSetting("dashcommerce", "paystackMode")) as
+	| string
+	| null
+	| undefined;
+const configuredPaystackMode: "test" | "live" | null =
+	paystackModeSetting == null || paystackModeSetting === "test"
+		? "test"
+		: paystackModeSetting === "live"
+			? "live"
+			: null;
+const paystackMode: "test" | "live" =
+	paymentProvider === "paystack-test" ? "test" : (configuredPaystackMode ?? "test");
+const paystackModeValid =
+	!isPaystack || paymentProvider === "paystack-test" || configuredPaystackMode !== null;
+const isPaystackTest = isPaystack && paystackModeValid && paystackMode === "test";
+const hostedPaymentProvider: "stripe" | "paystack" | "paystack-test" = isPaystack
+	? (paymentProvider as "paystack" | "paystack-test")
+	: "stripe";
+const supportedProvider = isStripe || isPaystack;
 
-const publishableKey = (await getPluginSetting("dashcommerce", "stripePublishableKey")) as string | null | undefined;
-const secretKey = (await getPluginSetting("dashcommerce", "stripeSecretKey")) as string | null | undefined;
-const webhookSecret = (await getPluginSetting("dashcommerce", "stripeWebhookSecret")) as string | null | undefined;
-const paystackSecretKey = (await getPluginSetting("dashcommerce", "paystackSecretKey")) as string | null | undefined;
+const publishableKey = (await getPluginSetting("dashcommerce", "stripePublishableKey")) as
+	| string
+	| null
+	| undefined;
+const secretKey = (await getPluginSetting("dashcommerce", "stripeSecretKey")) as
+	| string
+	| null
+	| undefined;
+const webhookSecret = (await getPluginSetting("dashcommerce", "stripeWebhookSecret")) as
+	| string
+	| null
+	| undefined;
 // `checkoutMode` controls whether we redirect to Stripe's hosted page
 // (default — lower PCI scope, simpler UI) or render Stripe Elements
 // on-site. Publishable key is only required for the embedded flow.
 const checkoutModeSetting = (await getPluginSetting("dashcommerce", "checkoutMode")) as
-  | "hosted"
-  | "embedded"
-  | null
-  | undefined;
+	| "hosted"
+	| "embedded"
+	| null
+	| undefined;
 const checkoutMode: "hosted" | "embedded" = checkoutModeSetting ?? "hosted";
 
 const missingKeys: string[] = [];
 if (isStripe) {
-  if (!secretKey) missingKeys.push("stripeSecretKey");
-  if (checkoutMode === "embedded" && !publishableKey) missingKeys.push("stripePublishableKey");
-  if (!webhookSecret) missingKeys.push("stripeWebhookSecret");
+	if (!secretKey) missingKeys.push("stripeSecretKey");
+	if (checkoutMode === "embedded" && !publishableKey) missingKeys.push("stripePublishableKey");
+	if (!webhookSecret) missingKeys.push("stripeWebhookSecret");
 }
-if (isPaystackTest) {
-  if (!paystackSecretKey?.startsWith("sk_test_")) missingKeys.push("paystackSecretKey (test key)");
-}
-
-const canCheckout = supportedProvider && missingKeys.length === 0;
-const hostedCheckout = isPaystackTest || checkoutMode === "hosted";
+// Paystack credentials are deliberately not read by the storefront. The
+// checkout endpoint resolves the selected environment's server-side secret.
+const canCheckout = supportedProvider && paystackModeValid && missingKeys.length === 0;
+const hostedCheckout = isPaystack || checkoutMode === "hosted";
 
 // Show a "payment canceled" banner when the customer hit Stripe's back
 // button and landed back here (`success_url`/`cancel_url` on the
@@ -61,7 +88,11 @@ const canceled = Astro.url.searchParams.get("canceled") === "1";
       <h1 class="co-title">Checkout</h1>
       <p class="co-subtitle">
         <span class="co-secure-icon" aria-hidden="true">🔒</span>
-        {isPaystackTest ? "Paystack TEST mode · No real payment" : "Secure · Encrypted · Stripe-powered"}
+        {isPaystackTest
+          ? "Paystack TEST mode · No real payment"
+          : isPaystack
+            ? "Secure · Encrypted · Paystack-powered"
+            : "Secure · Encrypted · Stripe-powered"}
       </p>
     </div>
   </div>
@@ -77,7 +108,7 @@ const canceled = Astro.url.searchParams.get("canceled") === "1";
           {!supportedProvider ? (
             <p>The configured payment provider is not supported. We will not fall back to another provider.</p>
           ) : (
-            <p>Payment setup is incomplete. Please ask the shop operator to finish configuring {isPaystackTest ? "Paystack test mode" : "Stripe"}.</p>
+            <p>Payment setup is incomplete. Please ask the shop operator to finish configuring {isPaystack ? (paystackModeValid ? `Paystack ${paystackMode} mode` : "Paystack mode") : "Stripe"}.</p>
           )}
         </div>
       )}
@@ -90,7 +121,10 @@ const canceled = Astro.url.searchParams.get("canceled") === "1";
       )}
 
       {canCheckout && hostedCheckout && (
-        <HostedCheckoutForm paymentProvider={isPaystackTest ? "paystack-test" : "stripe"} />
+        <HostedCheckoutForm
+          paymentProvider={hostedPaymentProvider}
+          paystackMode={paystackMode}
+        />
       )}
 
       {canCheckout && isStripe && checkoutMode === "embedded" && (

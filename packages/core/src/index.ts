@@ -48,7 +48,7 @@ export interface DashCommerceOptions {
 export function dashcommerce(options: DashCommerceOptions = {}): PluginDescriptor {
 	const id = options.id ?? DASHCOMMERCE_PLUGIN_ID;
 	if (id !== DASHCOMMERCE_PLUGIN_ID)
-		throw new Error("This spike's scoped host bridge supports only plugin id dashcommerce.");
+		throw new Error("The bundled host session integration supports only plugin id dashcommerce.");
 	const emdashVersion = options.emdashVersion ?? detectEmDashVersionAtBuildTime();
 	if (!emdashVersion)
 		throw new Error("Cannot detect installed EmDash version; refusing to assume compatibility.");
@@ -92,6 +92,7 @@ export function dashcommerce(options: DashCommerceOptions = {}): PluginDescripto
 			{ path: "/vendors", label: "Vendors", icon: "store" },
 			{ path: "/menus", label: "Menus", icon: "list" },
 			{ path: "/reports", label: "Reports", icon: "bar-chart" },
+			{ path: "/payment-operations", label: "Payment operations", icon: "credit-card" },
 			{ path: "/settings", label: "Settings", icon: "settings" },
 		],
 		adminWidgets: [

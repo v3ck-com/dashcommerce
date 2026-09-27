@@ -42,6 +42,7 @@ import { productBeforeSave } from "./hooks/content";
 import { cronHandler } from "./hooks/cron";
 import { onActivate, onInstall } from "./hooks/install";
 import { adminApiRoutes } from "./routes/admin-api";
+import { paymentOperationsRoutes } from "./routes/payment-operations";
 import { cartRoutes } from "./routes/cart";
 import { checkoutRoutes } from "./routes/checkout";
 import { configCheckRoutes } from "./routes/config-check";
@@ -51,7 +52,7 @@ import { ordersPublicRoutes } from "./routes/orders-public";
 import { validateEmDashCompatibility } from "./version-check";
 import { reviewsPublicRoutes } from "./routes/reviews-public";
 import { subscriptionsPublicRoutes } from "./routes/subscriptions-public";
-import { webhookRoutes } from "./routes/webhook";
+import { paystackWebhookRoutes, webhookRoutes } from "./routes/webhook";
 import { DASHCOMMERCE_STORAGE } from "./storage-collections";
 
 const DEFAULT_CAPABILITIES: PluginCapability[] = [
@@ -96,7 +97,9 @@ const ROUTES = {
 	...reviewsPublicRoutes,
 	...subscriptionsPublicRoutes,
 	...webhookRoutes,
+	...paystackWebhookRoutes,
 	...adminApiRoutes,
+	...paymentOperationsRoutes,
 } as unknown as Record<string, CommerceRouteEntry>;
 
 /**
@@ -190,6 +193,7 @@ const ADMIN_PAGES: PluginAdminPage[] = [
 	{ path: "/vendors", label: "Vendors", icon: "store" },
 	{ path: "/menus", label: "Menus", icon: "list" },
 	{ path: "/reports", label: "Reports", icon: "bar-chart" },
+	{ path: "/payment-operations", label: "Payment operations", icon: "credit-card" },
 	{ path: "/settings", label: "Settings", icon: "settings" },
 ];
 
@@ -259,7 +263,9 @@ export function createPlugin(options: CreatePluginOptions = {}) {
 		admin: {
 			// EmDash encrypts declared secrets at rest and registers log redaction.
 			settingsSchema: {
-				paystackSecretKey: { type: "secret", label: "Paystack test secret key" },
+				paystackSecretKey: { type: "secret", label: "Legacy Paystack test secret key" },
+				paystackTestSecretKey: { type: "secret", label: "Paystack test secret key" },
+				paystackLiveSecretKey: { type: "secret", label: "Paystack live secret key" },
 				stripeSecretKey: { type: "secret", label: "Stripe secret key" },
 				stripeWebhookSecret: { type: "secret", label: "Stripe webhook signing secret" },
 			},

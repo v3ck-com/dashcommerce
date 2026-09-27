@@ -14,16 +14,33 @@ const definition = {
 
 function fixture(customisable = true, withVariant = true) {
 	const data = new Map<string, string>();
+	const kvRevisions = new Map<string, number>();
 	const rows = new Map<string, Map<string, unknown>>();
 	const collection = (name: string) => {
 		if (!rows.has(name)) rows.set(name, new Map());
 		const store = rows.get(name)!;
+		const revisions = new Map<string, number>();
 		return {
 			async get(id: string) {
-				return store.get(id) ?? null;
+				const value = store.get(id);
+				return value === undefined ? null : structuredClone(value);
+			},
+			async getVersioned(id: string) {
+				const value = store.get(id);
+				return value === undefined
+					? null
+					: { value: structuredClone(value), revision: String(revisions.get(id) ?? 0) };
 			},
 			async put(id: string, value: unknown) {
 				store.set(id, structuredClone(value));
+				revisions.set(id, (revisions.get(id) ?? 0) + 1);
+			},
+			async compareAndSet(id: string, expected: string | null, value: unknown) {
+				const revision = store.has(id) ? String(revisions.get(id) ?? 0) : null;
+				if (revision !== expected) return { applied: false };
+				store.set(id, structuredClone(value));
+				revisions.set(id, (revisions.get(id) ?? 0) + 1);
+				return { applied: true, revision: String(revisions.get(id)) };
 			},
 			async putMany(entries: Array<{ id: string; data: unknown }>) {
 				for (const entry of entries) store.set(entry.id, structuredClone(entry.data));
@@ -44,20 +61,52 @@ function fixture(customisable = true, withVariant = true) {
 	};
 	collection("product_variants");
 	if (withVariant)
-		rows
-			.get("product_variants")!
-			.set("v1", { id: "v1", productId: "p1", stockQuantity: null, isActive: true });
+		rows.get("product_variants")!.set("v1", {
+			id: "v1",
+			productId: "p1",
+			sku: "ENGRAVED-1",
+			// Empty native price map deliberately inherits the parent price.
+			prices: {},
+			stockQuantity: null,
+			weightGrams: null,
+			attributes: {},
+			isActive: true,
+			createdAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+		});
 	const ctx = {
 		kv: {
 			async get(key: string) {
 				const value = data.get(key);
 				return value === undefined ? null : JSON.parse(value);
 			},
+			async getVersioned(key: string) {
+				const value = data.get(key);
+				return value === undefined
+					? null
+					: { value: JSON.parse(value), revision: String(kvRevisions.get(key) ?? 0) };
+			},
 			async set(key: string, value: unknown) {
 				data.set(key, JSON.stringify(value));
+				kvRevisions.set(key, (kvRevisions.get(key) ?? 0) + 1);
+			},
+			async compareAndSet(key: string, expected: string | null, value: unknown) {
+				const revision = data.has(key) ? String(kvRevisions.get(key) ?? 0) : null;
+				if (revision !== expected) return { applied: false };
+				data.set(key, JSON.stringify(value));
+				kvRevisions.set(key, (kvRevisions.get(key) ?? 0) + 1);
+				return { applied: true, revision: String(kvRevisions.get(key)) };
+			},
+			async compareAndDelete(key: string, expected: string) {
+				if (!data.has(key) || String(kvRevisions.get(key) ?? 0) !== expected)
+					return { applied: false };
+				data.delete(key);
+				kvRevisions.set(key, (kvRevisions.get(key) ?? 0) + 1);
+				return { applied: true };
 			},
 			async delete(key: string) {
 				data.delete(key);
+				kvRevisions.set(key, (kvRevisions.get(key) ?? 0) + 1);
 			},
 		},
 		content: {
@@ -75,10 +124,15 @@ function fixture(customisable = true, withVariant = true) {
 					: null;
 			},
 		},
+		site: { name: "Test shop", url: "https://shop.test" },
 		storage: {
 			orders: collection("orders"),
 			order_items: collection("order_items"),
 			customers: collection("customers"),
+			payments: collection("payments"),
+			commerce_outbox: collection("commerce_outbox"),
+			coupons: collection("coupons"),
+			coupon_usage: collection("coupon_usage"),
 			product_variants: collection("product_variants"),
 		},
 		log: { info() {}, debug() {}, warn() {}, error() {} },
@@ -152,7 +206,14 @@ describe("server-declared cart customisation", () => {
 			country: "US",
 		};
 		const result = await createOrderFromPaymentIntent(ctx, {
-			paymentIntent: { id: "pi_test", receipt_email: "test@example.invalid" } as never,
+			paymentIntent: {
+				id: "pi_test",
+				livemode: false,
+				receipt_email: "test@example.invalid",
+				status: "succeeded",
+				amount_received: 12_500,
+				currency: "usd",
+			} as never,
 			cartSnapshot: {
 				...persisted!,
 				billingAddress: address,

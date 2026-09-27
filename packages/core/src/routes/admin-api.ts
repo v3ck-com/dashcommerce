@@ -10,6 +10,7 @@
 
 import type { PluginContext, RouteContext, StorageCollection } from "emdash";
 import { randomId } from "../util/ids";
+import { isTestOrder } from "../util/order-environment";
 import { add, money, sub, zero, type Money } from "../money";
 import type {
 	Coupon,
@@ -28,7 +29,7 @@ import type {
 	Vendor,
 	VendorPayout,
 } from "../types";
-import { refundOrder } from "../orders/refund";
+import { refundOrder, RefundRecoveryRequired } from "../orders/refund";
 import { sendReviewRequest } from "../emails";
 import { normalizeProductFields } from "../products/normalize";
 import { recomputeSummary } from "../reviews/moderate";
@@ -55,7 +56,7 @@ import { normalizeCurrencyList } from "../data/currencies";
 function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { "Content-Type": "application/json" },
+		headers: { "Content-Type": "application/json", "Cache-Control": "private, no-store" },
 	});
 }
 
@@ -116,7 +117,9 @@ function connectOffResponse(): Response {
 }
 
 function storeOf<T>(ctx: PluginContext, name: string): StorageCollection<T> {
-	return (ctx.storage as unknown as Record<string, StorageCollection<T>>)[name] as StorageCollection<T>;
+	return (ctx.storage as unknown as Record<string, StorageCollection<T>>)[
+		name
+	] as StorageCollection<T>;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -132,10 +135,7 @@ function secretHint(value: unknown): string {
 // Handlers
 // ────────────────────────────────────────────────────────────────────────────
 
-async function queryOrders(
-	ctx: PluginContext,
-	req: Request,
-): Promise<Response> {
+async function queryOrders(ctx: PluginContext, req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const status = url.searchParams.get("status");
 	const paymentStatus = url.searchParams.get("paymentStatus");
@@ -209,19 +209,14 @@ async function queryOrders(
 			{
 				error: "query_failed",
 				message:
-					err instanceof Error
-						? err.message
-						: "Could not query orders — please contact support",
+					err instanceof Error ? err.message : "Could not query orders — please contact support",
 			},
 			500,
 		);
 	}
 }
 
-async function getOrderDetail(
-	ctx: PluginContext,
-	orderId: string,
-): Promise<Response> {
+async function getOrderDetail(ctx: PluginContext, orderId: string): Promise<Response> {
 	const order = await storeOf<Order>(ctx, "orders").get(orderId);
 	if (!order) return json({ error: "Order not found" }, 404);
 	const items = (
@@ -244,17 +239,34 @@ async function postOrderRefund(
 	orderId: string,
 	routeCtx: RouteContext,
 ): Promise<Response> {
-	const client = await loadStripeClient(ctx);
-	if (!client) return json({ error: "Stripe not configured" }, 500);
+	const order = await storeOf<Order>(ctx, "orders").get(orderId);
+	if (!order) return json({ error: "Order not found" }, 404);
+	const isPaystack =
+		order.paymentProvider === "paystack" || order.paymentProvider === "paystack-test";
+	const client = isPaystack ? undefined : await loadStripeClient(ctx);
+	if (!isPaystack && !client) return json({ error: "Stripe not configured" }, 500);
 	const input = (routeCtx.input ?? {}) as {
+		requestId?: string;
+		idempotencyKey?: string;
 		amount?: number;
 		currency?: string;
 		reason?: string;
 		restock?: boolean;
-		lineItemRefunds?: Array<{ orderItemId: string; quantity: number; amount: number; currency: string }>;
+		lineItemRefunds?: Array<{
+			orderItemId: string;
+			quantity: number;
+			amount: number;
+			currency: string;
+		}>;
 	};
-	if (typeof input.amount !== "number" || !input.currency) {
-		return json({ error: "amount (minor units) and currency required" }, 400);
+	const requestId = input.requestId ?? input.idempotencyKey;
+	if (
+		typeof input.amount !== "number" ||
+		!input.currency ||
+		typeof requestId !== "string" ||
+		!/^[A-Za-z0-9:_-]{8,200}$/.test(requestId)
+	) {
+		return json({ error: "amount (minor units), currency and stable requestId required" }, 400);
 	}
 	try {
 		const refund = await refundOrder(ctx, {
@@ -271,15 +283,22 @@ async function postOrderRefund(
 						})),
 					}
 				: {}),
-			client,
-			idempotencyKey: `refund:${orderId}:${randomId()}`,
+			...(client ? { client } : {}),
+			idempotencyKey: requestId,
 		});
 		return json({ refund });
 	} catch (err) {
-		return json(
-			{ error: err instanceof Error ? err.message : "Refund failed" },
-			400,
-		);
+		if (err instanceof RefundRecoveryRequired)
+			return json(
+				{
+					refund: err.refund,
+					recoveryRequired: true,
+					message:
+						"Refund outcome or local effects require reconciliation. Keep the same request ID; do not submit another refund.",
+				},
+				202,
+			);
+		return json({ error: err instanceof Error ? err.message : "Refund failed" }, 400);
 	}
 }
 
@@ -290,29 +309,43 @@ async function postOrderStatus(
 ): Promise<Response> {
 	const body = (routeCtx.input ?? {}) as { status?: Order["status"] };
 	if (!body.status) return json({ error: "status required" }, 400);
-	const order = await storeOf<Order>(ctx, "orders").get(orderId);
-	if (!order) return json({ error: "Order not found" }, 404);
-	try {
-		assertTransition(order.status, body.status);
-	} catch (err) {
-		return json(
-			{ error: err instanceof Error ? err.message : "Invalid transition" },
-			400,
-		);
+	const store = storeOf<Order>(ctx, "orders");
+	let order: Order | undefined;
+	let updated: Order | undefined;
+	let applied = false;
+	for (let retry = 0; retry < 8; retry++) {
+		const current = await store.getVersioned(orderId);
+		if (!current) return json({ error: "Order not found" }, 404);
+		order = current.value;
+		try {
+			assertTransition(order.status, body.status);
+		} catch (err) {
+			return json({ error: err instanceof Error ? err.message : "Invalid transition" }, 400);
+		}
+		updated = {
+			...order,
+			status: body.status,
+			updatedAt: new Date().toISOString(),
+			...(body.status === "completed" ? { completedAt: new Date().toISOString() } : {}),
+			...(body.status === "cancelled" ? { cancelledAt: new Date().toISOString() } : {}),
+		};
+		if ((await store.compareAndSet(orderId, current.revision, updated)).applied) {
+			applied = true;
+			break;
+		}
 	}
-	const updated: Order = {
-		...order,
-		status: body.status,
-		updatedAt: new Date().toISOString(),
-		...(body.status === "completed" ? { completedAt: new Date().toISOString() } : {}),
-		...(body.status === "cancelled" ? { cancelledAt: new Date().toISOString() } : {}),
-	};
-	await storeOf<Order>(ctx, "orders").put(orderId, updated);
+	if (!applied || !order || !updated)
+		return json({ error: "Order changed concurrently; refresh and retry" }, 409);
 
 	// On fulfilment flip, queue a post-purchase review request. Best-effort
 	// and rate-limited inside `sendReviewRequest` via a KV marker, so a
 	// merchant flipping statuses back and forth won't cause duplicate sends.
-	if (order.status !== "completed" && body.status === "completed") {
+	if (
+		order.status !== "completed" &&
+		body.status === "completed" &&
+		!isTestOrder(order) &&
+		(await ctx.kv.get("settings:receiptEmailEnabled")) === true
+	) {
 		try {
 			const items = await loadOrderItems(ctx, orderId);
 			// Best guess at product permalinks — the host site decides the
@@ -333,10 +366,7 @@ async function postOrderStatus(
 	return json({ order: updated });
 }
 
-async function loadOrderItems(
-	ctx: PluginContext,
-	orderId: string,
-): Promise<OrderItem[]> {
+async function loadOrderItems(ctx: PluginContext, orderId: string): Promise<OrderItem[]> {
 	const res = await storeOf<OrderItem>(ctx, "order_items").query({
 		where: { orderId },
 		limit: 200,
@@ -344,10 +374,7 @@ async function loadOrderItems(
 	return res.items.map((r) => ({ ...(r.data as OrderItem), id: r.id }));
 }
 
-async function queryCustomers(
-	ctx: PluginContext,
-	req: Request,
-): Promise<Response> {
+async function queryCustomers(ctx: PluginContext, req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const search = url.searchParams.get("search")?.trim().toLowerCase();
 	const guestFilter = url.searchParams.get("guest"); // "true" | "false" | null
@@ -401,19 +428,14 @@ async function queryCustomers(
 			{
 				error: "query_failed",
 				message:
-					err instanceof Error
-						? err.message
-						: "Could not query customers — please contact support",
+					err instanceof Error ? err.message : "Could not query customers — please contact support",
 			},
 			500,
 		);
 	}
 }
 
-async function getCustomerDetail(
-	ctx: PluginContext,
-	customerId: string,
-): Promise<Response> {
+async function getCustomerDetail(ctx: PluginContext, customerId: string): Promise<Response> {
 	const customer = await storeOf<Customer>(ctx, "customers").get(customerId);
 	if (!customer) return json({ error: "Customer not found" }, 404);
 	const [orders, subs] = await Promise.all([
@@ -461,10 +483,10 @@ async function upsertCoupon(
 ): Promise<Coupon> {
 	const now = new Date().toISOString();
 	const id = couponId ?? randomId();
-	const existing = couponId
-		? await storeOf<Coupon>(ctx, "coupons").get(couponId)
-		: null;
+	const existing = couponId ? await storeOf<Coupon>(ctx, "coupons").get(couponId) : null;
 	const record: Coupon = {
+		// Preserve private additive quota CAS metadata during normal admin edits.
+		...(existing ?? {}),
 		id,
 		code: input.code.toUpperCase(),
 		...(input.description ? { description: input.description } : {}),
@@ -476,12 +498,10 @@ async function upsertCoupon(
 		...(input.endsAt ? { endsAt: input.endsAt } : {}),
 		...(input.minAmount ? { minAmount: input.minAmount } : {}),
 		...(input.maxAmount ? { maxAmount: input.maxAmount } : {}),
-		...(input.includedProductIds
-			? { includedProductIds: input.includedProductIds }
-			: {}),
-		...(input.excludedProductIds
-			? { excludedProductIds: input.excludedProductIds }
-			: {}),
+		...(input.includedProductIds ? { includedProductIds: input.includedProductIds } : {}),
+		...(input.excludedProductIds ? { excludedProductIds: input.excludedProductIds } : {}),
+		...(input.includedCategorySlugs ? { includedCategorySlugs: input.includedCategorySlugs } : {}),
+		...(input.excludedCategorySlugs ? { excludedCategorySlugs: input.excludedCategorySlugs } : {}),
 		excludeSaleItems: input.excludeSaleItems ?? false,
 		...(input.usageLimit !== undefined ? { usageLimit: input.usageLimit } : {}),
 		...(input.usageLimitPerCustomer !== undefined
@@ -492,8 +512,48 @@ async function upsertCoupon(
 		createdAt: existing?.createdAt ?? now,
 		updatedAt: now,
 	};
-	await storeOf<Coupon>(ctx, "coupons").put(id, record);
-	return record;
+	// Merchant edits must not overwrite concurrently committed redemption
+	// counts, quota claims or idempotency maps with an older form snapshot.
+	const store = storeOf<Coupon>(ctx, "coupons");
+	const optionalConfiguration = [
+		"description",
+		"currency",
+		"startsAt",
+		"endsAt",
+		"minAmount",
+		"maxAmount",
+		"includedProductIds",
+		"excludedProductIds",
+		"includedCategorySlugs",
+		"excludedCategorySlugs",
+		"usageLimit",
+		"usageLimitPerCustomer",
+	];
+	for (let attempt = 0; attempt < 12; attempt++) {
+		const current = await store.getVersioned(id);
+		const aliases = new Set(current?.value.historicalCodes ?? []);
+		if (current?.value.code && current.value.code !== record.code) aliases.add(current.value.code);
+		if (aliases.size > 64) throw new Error("Coupon code history is full; create a new coupon");
+		const next: Record<string, unknown> = {
+			...current?.value,
+			...record,
+			usageCount: current?.value.usageCount ?? 0,
+			createdAt: current?.value.createdAt ?? now,
+			historicalCodes: [...aliases],
+		};
+		// Quota metadata and accounting always come from the latest CAS value,
+		// never the stale admin form snapshot.
+		for (const key of Object.keys(current?.value ?? {}))
+			if (key.startsWith("_quota") || key === "accountedOrderIds")
+				next[key] = (current?.value as unknown as Record<string, unknown>)[key];
+		next.usageCount = current?.value.usageCount ?? 0;
+		for (const key of optionalConfiguration) if (!(key in record)) delete next[key];
+		const result = current
+			? await store.compareAndSet(id, current.revision, next as unknown as Coupon)
+			: await store.compareAndSet(id, null, next as unknown as Coupon);
+		if (result.applied) return next as unknown as Coupon;
+	}
+	throw new Error("Coupon changed concurrently; reload and retry");
 }
 
 async function listShippingZones(ctx: PluginContext): Promise<Response> {
@@ -601,10 +661,7 @@ function validateTaxRateInput(
 	return { ok: true, value: out };
 }
 
-async function postTaxRate(
-	ctx: PluginContext,
-	routeCtx: RouteContext,
-): Promise<Response> {
+async function postTaxRate(ctx: PluginContext, routeCtx: RouteContext): Promise<Response> {
 	const input = (routeCtx.input ?? {}) as Record<string, unknown>;
 	const validated = validateTaxRateInput(input);
 	if (!validated.ok) return json({ error: validated.error }, 400);
@@ -685,10 +742,7 @@ function validateShippingZone(
 				};
 			}
 			if (l.regions !== undefined) {
-				if (
-					!Array.isArray(l.regions) ||
-					l.regions.some((r) => typeof r !== "string")
-				) {
+				if (!Array.isArray(l.regions) || l.regions.some((r) => typeof r !== "string")) {
 					return { ok: false, error: "regions must be an array of strings" };
 				}
 				locations.push({ country: l.country, regions: l.regions as string[] });
@@ -711,10 +765,7 @@ function validateShippingZone(
 	return { ok: true, value: out };
 }
 
-async function postShippingZone(
-	ctx: PluginContext,
-	routeCtx: RouteContext,
-): Promise<Response> {
+async function postShippingZone(ctx: PluginContext, routeCtx: RouteContext): Promise<Response> {
 	const input = (routeCtx.input ?? {}) as Record<string, unknown>;
 	const v = validateShippingZone(input);
 	if (!v.ok) return json({ error: v.error }, 400);
@@ -753,10 +804,7 @@ async function patchShippingZone(
 	return json({ zone: next });
 }
 
-async function deleteShippingZone(
-	ctx: PluginContext,
-	id: string,
-): Promise<Response> {
+async function deleteShippingZone(ctx: PluginContext, id: string): Promise<Response> {
 	const store = storeOf<ShippingZone>(ctx, "shipping_zones");
 	const current = await store.get(id);
 	if (!current) return json({ error: "Zone not found" }, 404);
@@ -771,8 +819,7 @@ async function deleteShippingZone(
 	if (zoneHasMethods) {
 		return json(
 			{
-				error:
-					"Zone still has methods — delete the methods first or move them to another zone.",
+				error: "Zone still has methods — delete the methods first or move them to another zone.",
 			},
 			409,
 		);
@@ -807,8 +854,7 @@ function validateShippingMethod(
 		) {
 			return {
 				ok: false,
-				error:
-					"type must be one of flat_rate | free_shipping | local_pickup | weight_based",
+				error: "type must be one of flat_rate | free_shipping | local_pickup | weight_based",
 			};
 		}
 		out.type = input.type;
@@ -838,10 +884,7 @@ function validateShippingMethod(
 	return { ok: true, value: out };
 }
 
-async function postShippingMethod(
-	ctx: PluginContext,
-	routeCtx: RouteContext,
-): Promise<Response> {
+async function postShippingMethod(ctx: PluginContext, routeCtx: RouteContext): Promise<Response> {
 	const input = (routeCtx.input ?? {}) as Record<string, unknown>;
 	const v = validateShippingMethod(input);
 	if (!v.ok) return json({ error: v.error }, 400);
@@ -875,10 +918,7 @@ async function patchShippingMethod(
 	return json({ method: next });
 }
 
-async function deleteShippingMethod(
-	ctx: PluginContext,
-	id: string,
-): Promise<Response> {
+async function deleteShippingMethod(ctx: PluginContext, id: string): Promise<Response> {
 	const store = storeOf<ShippingMethod>(ctx, "shipping_methods");
 	const current = await store.get(id);
 	if (!current) return json({ error: "Method not found" }, 404);
@@ -918,10 +958,7 @@ function validateShippingClass(
 	return { ok: true, value: out };
 }
 
-async function postShippingClass(
-	ctx: PluginContext,
-	routeCtx: RouteContext,
-): Promise<Response> {
+async function postShippingClass(ctx: PluginContext, routeCtx: RouteContext): Promise<Response> {
 	const input = (routeCtx.input ?? {}) as Record<string, unknown>;
 	const v = validateShippingClass(input);
 	if (!v.ok) return json({ error: v.error }, 400);
@@ -930,9 +967,7 @@ async function postShippingClass(
 		id,
 		slug: v.value.slug as string,
 		name: v.value.name as string,
-		...(v.value.description !== undefined
-			? { description: v.value.description }
-			: {}),
+		...(v.value.description !== undefined ? { description: v.value.description } : {}),
 	};
 	try {
 		await storeOf<ShippingClass>(ctx, "shipping_classes").put(id, row);
@@ -973,10 +1008,7 @@ async function patchShippingClass(
 	return json({ class: next });
 }
 
-async function deleteShippingClass(
-	ctx: PluginContext,
-	id: string,
-): Promise<Response> {
+async function deleteShippingClass(ctx: PluginContext, id: string): Promise<Response> {
 	const store = storeOf<ShippingClass>(ctx, "shipping_classes");
 	const current = await store.get(id);
 	if (!current) return json({ error: "Class not found" }, 404);
@@ -984,10 +1016,7 @@ async function deleteShippingClass(
 	return json({ ok: true });
 }
 
-async function listSubscriptions(
-	ctx: PluginContext,
-	req: Request,
-): Promise<Response> {
+async function listSubscriptions(ctx: PluginContext, req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const status = url.searchParams.get("status");
 	const email = url.searchParams.get("email")?.trim().toLowerCase();
@@ -1039,9 +1068,7 @@ async function listSubscriptions(
 				}),
 			);
 			const emailById = new Map(customers);
-			items = items.filter((s) =>
-				(emailById.get(s.customerId) ?? "").includes(email),
-			);
+			items = items.filter((s) => (emailById.get(s.customerId) ?? "").includes(email));
 		}
 		return json({ items, cursor: result.cursor, hasMore: result.hasMore });
 	} catch (err) {
@@ -1096,10 +1123,7 @@ async function postSubscriptionAction(
 		}
 		return json({ error: `Unknown action ${action}` }, 400);
 	} catch (err) {
-		return json(
-			{ error: err instanceof Error ? err.message : "Action failed" },
-			500,
-		);
+		return json({ error: err instanceof Error ? err.message : "Action failed" }, 500);
 	}
 }
 
@@ -1161,9 +1185,7 @@ async function listReviews(ctx: PluginContext, req: Request): Promise<Response> 
 			{
 				error: "query_failed",
 				message:
-					err instanceof Error
-						? err.message
-						: "Could not query reviews — please contact support",
+					err instanceof Error ? err.message : "Could not query reviews — please contact support",
 			},
 			500,
 		);
@@ -1181,21 +1203,13 @@ async function postReviewModerate(
 	};
 	if (!body.status) return json({ error: "status required" }, 400);
 	try {
-		const updated = await moderateReview(
-			ctx,
-			reviewId,
-			body.status,
-			body.moderatedByUserId,
-		);
+		const updated = await moderateReview(ctx, reviewId, body.status, body.moderatedByUserId);
 		if (body.status === "approved" || updated.status === "approved") {
 			await recomputeSummary(ctx, updated.productId);
 		}
 		return json({ review: updated });
 	} catch (err) {
-		return json(
-			{ error: err instanceof Error ? err.message : "Moderation failed" },
-			500,
-		);
+		return json({ error: err instanceof Error ? err.message : "Moderation failed" }, 500);
 	}
 }
 
@@ -1265,10 +1279,7 @@ async function patchVendor(
 	return json({ vendor: { ...next, id: vendorId } });
 }
 
-async function refreshVendorFromStripe(
-	ctx: PluginContext,
-	vendorId: string,
-): Promise<Response> {
+async function refreshVendorFromStripe(ctx: PluginContext, vendorId: string): Promise<Response> {
 	const client = await loadStripeClient(ctx);
 	if (!client) return json({ error: "Stripe not configured" }, 500);
 	const store = storeOf<Vendor>(ctx, "vendors");
@@ -1301,10 +1312,7 @@ async function refreshVendorFromStripe(
 		await store.put(vendorId, next);
 		return json({ vendor: { ...next, id: vendorId } });
 	} catch (err) {
-		return json(
-			{ error: err instanceof Error ? err.message : "Stripe refresh failed" },
-			502,
-		);
+		return json({ error: err instanceof Error ? err.message : "Stripe refresh failed" }, 502);
 	}
 }
 
@@ -1324,10 +1332,7 @@ async function postVendorOnboardLink(
 		returnUrl?: string;
 	};
 	if (!body.email || !body.name || !body.refreshUrl || !body.returnUrl) {
-		return json(
-			{ error: "email, name, refreshUrl, returnUrl are required" },
-			400,
-		);
+		return json({ error: "email, name, refreshUrl, returnUrl are required" }, 400);
 	}
 	const result = await startOnboarding(ctx, {
 		...(body.vendorId ? { vendorId: body.vendorId } : {}),
@@ -1380,10 +1385,7 @@ function parseToMs(value: string | null): number {
 		: Date.parse(value);
 }
 
-async function reportRevenue(
-	ctx: PluginContext,
-	req: Request,
-): Promise<Response> {
+async function reportRevenue(ctx: PluginContext, req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const fromMs = Date.parse(url.searchParams.get("from") ?? "1970-01-01T00:00:00Z");
 	const toMs = parseToMs(url.searchParams.get("to"));
@@ -1396,6 +1398,7 @@ async function reportRevenue(
 	const byBucket = new Map<string, Map<string, number>>();
 	for (const row of result.items) {
 		const o = row.data as Order;
+		if (isTestOrder(o)) continue;
 		const ts = Date.parse(o.createdAt);
 		if (ts < fromMs || ts > toMs) continue;
 		const bucket = bucketFor(o.createdAt, groupBy);
@@ -1420,18 +1423,13 @@ function bucketFor(iso: string, groupBy: string): string {
 		const day = d.getUTCDay() || 7;
 		d.setUTCDate(d.getUTCDate() + 4 - day);
 		const year = d.getUTCFullYear();
-		const weekNum = Math.ceil(
-			((d.getTime() - Date.UTC(year, 0, 1)) / 86_400_000 + 1) / 7,
-		);
+		const weekNum = Math.ceil(((d.getTime() - Date.UTC(year, 0, 1)) / 86_400_000 + 1) / 7);
 		return `${year}-W${String(weekNum).padStart(2, "0")}`;
 	}
 	return iso.slice(0, 10);
 }
 
-async function reportTopProducts(
-	ctx: PluginContext,
-	req: Request,
-): Promise<Response> {
+async function reportTopProducts(ctx: PluginContext, req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const limit = Math.min(50, Number.parseInt(url.searchParams.get("limit") ?? "10", 10));
 	const fromMs = Date.parse(url.searchParams.get("from") ?? "1970-01-01T00:00:00Z");
@@ -1443,6 +1441,7 @@ async function reportTopProducts(
 	const inRangeOrderIds = new Set<string>();
 	for (const row of orderPage.items) {
 		const o = row.data as Order;
+		if (isTestOrder(o)) continue;
 		const ts = Date.parse(o.createdAt);
 		if (ts >= fromMs && ts <= toMs) inRangeOrderIds.add(row.id);
 	}
@@ -1467,16 +1466,11 @@ async function reportTopProducts(
 		prev.revenue += it.total.amount;
 		counts.set(key, prev);
 	}
-	const items = [...counts.values()]
-		.sort((a, b) => b.revenue - a.revenue)
-		.slice(0, limit);
+	const items = [...counts.values()].sort((a, b) => b.revenue - a.revenue).slice(0, limit);
 	return json({ items });
 }
 
-async function reportTopCustomers(
-	ctx: PluginContext,
-	req: Request,
-): Promise<Response> {
+async function reportTopCustomers(ctx: PluginContext, req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const limit = Math.min(50, Number.parseInt(url.searchParams.get("limit") ?? "10", 10));
 	const result = await storeOf<Customer>(ctx, "customers").query({ limit: 1000 });
@@ -1530,6 +1524,7 @@ async function widgetRevenue(ctx: PluginContext): Promise<Response> {
 	const thirty: Record<string, number> = {};
 	for (const row of result.items) {
 		const o = row.data as Order;
+		if (isTestOrder(o)) continue;
 		if (o.createdAt >= thirtyAgo) {
 			thirty[o.currency] = (thirty[o.currency] ?? 0) + o.paidTotal.amount;
 		}
@@ -1546,9 +1541,7 @@ async function widgetLowStock(ctx: PluginContext): Promise<Response> {
 	const result = await ctx.content.list("products", { limit: 200 });
 	const items = result.items
 		.map((it) => {
-			const data = normalizeProductFields(
-				it.data as Record<string, unknown>,
-			);
+			const data = normalizeProductFields(it.data as Record<string, unknown>);
 			return {
 				productId: it.id,
 				title: data.title,
@@ -1594,9 +1587,7 @@ async function widgetFailedSubscriptions(ctx: PluginContext): Promise<Response> 
 	});
 	return json({
 		count: result.items.length,
-		items: result.items
-			.slice(0, 5)
-			.map((r) => ({ ...(r.data as Subscription), id: r.id })),
+		items: result.items.slice(0, 5).map((r) => ({ ...(r.data as Subscription), id: r.id })),
 	});
 }
 
@@ -1619,6 +1610,8 @@ export const adminApiRoutes = {
 		},
 	},
 	"admin/orders/refund": {
+		methods: ["POST"] as const,
+		request: { body: "json" as const, maxBytes: 32768 },
 		handler: async (routeCtx: RouteContext, _c?: PluginContext) => {
 			const ctx = getCtx(routeCtx, _c);
 			const id = queryOrPath(routeCtx.request, "id", "orders");
@@ -1627,6 +1620,8 @@ export const adminApiRoutes = {
 		},
 	},
 	"admin/orders/status": {
+		methods: ["POST"] as const,
+		request: { body: "json" as const, maxBytes: 32768 },
 		handler: async (routeCtx: RouteContext, _c?: PluginContext) => {
 			const ctx = getCtx(routeCtx, _c);
 			const id = queryOrPath(routeCtx.request, "id", "orders");
@@ -1662,6 +1657,7 @@ export const adminApiRoutes = {
 		},
 	},
 	"admin/coupons/item": {
+		methods: ["GET", "POST", "DELETE"] as const,
 		handler: async (routeCtx: RouteContext, _c?: PluginContext) => {
 			const ctx = getCtx(routeCtx, _c);
 			const id = queryOrPath(routeCtx.request, "id", "coupons");
@@ -1670,12 +1666,16 @@ export const adminApiRoutes = {
 				await storeOf<Coupon>(ctx, "coupons").delete(id);
 				return json({ ok: true });
 			}
+			const existing = await storeOf<Coupon>(ctx, "coupons").get(id);
+			if (!existing) return json({ error: "Coupon not found" }, 404);
+			if (routeCtx.request.method === "GET") return json({ coupon: existing });
 			const body = routeCtx.input as Partial<Coupon>;
-			const coupon = await upsertCoupon(
-				ctx,
-				{ ...body, code: body.code ?? "" } as Partial<Coupon> & { code: string },
-				id,
-			);
+			if (
+				!body ||
+				(body.code !== undefined && (typeof body.code !== "string" || !body.code.trim()))
+			)
+				return json({ error: "Valid coupon fields required" }, 400);
+			const coupon = await upsertCoupon(ctx, { ...body, code: body.code ?? existing.code }, id);
 			return json({ coupon });
 		},
 	},
@@ -1688,8 +1688,7 @@ export const adminApiRoutes = {
 	"admin/shipping/zones": {
 		handler: async (routeCtx: RouteContext, _c?: PluginContext) => {
 			const ctx = getCtx(routeCtx, _c);
-			if (routeCtx.request.method === "POST")
-				return postShippingZone(ctx, routeCtx);
+			if (routeCtx.request.method === "POST") return postShippingZone(ctx, routeCtx);
 			return listShippingZones(ctx);
 		},
 	},
@@ -1698,18 +1697,15 @@ export const adminApiRoutes = {
 			const ctx = getCtx(routeCtx, _c);
 			const id = queryOrPath(routeCtx.request, "id", "zones");
 			if (!id) return json({ error: "Missing zone id" }, 400);
-			if (routeCtx.request.method === "PATCH")
-				return patchShippingZone(ctx, id, routeCtx);
-			if (routeCtx.request.method === "DELETE")
-				return deleteShippingZone(ctx, id);
+			if (routeCtx.request.method === "PATCH") return patchShippingZone(ctx, id, routeCtx);
+			if (routeCtx.request.method === "DELETE") return deleteShippingZone(ctx, id);
 			return json({ error: "Method not allowed" }, 405);
 		},
 	},
 	"admin/shipping/methods": {
 		handler: async (routeCtx: RouteContext, _c?: PluginContext) => {
 			const ctx = getCtx(routeCtx, _c);
-			if (routeCtx.request.method === "POST")
-				return postShippingMethod(ctx, routeCtx);
+			if (routeCtx.request.method === "POST") return postShippingMethod(ctx, routeCtx);
 			return json({ error: "Method not allowed" }, 405);
 		},
 	},
@@ -1718,18 +1714,15 @@ export const adminApiRoutes = {
 			const ctx = getCtx(routeCtx, _c);
 			const id = queryOrPath(routeCtx.request, "id", "methods");
 			if (!id) return json({ error: "Missing method id" }, 400);
-			if (routeCtx.request.method === "PATCH")
-				return patchShippingMethod(ctx, id, routeCtx);
-			if (routeCtx.request.method === "DELETE")
-				return deleteShippingMethod(ctx, id);
+			if (routeCtx.request.method === "PATCH") return patchShippingMethod(ctx, id, routeCtx);
+			if (routeCtx.request.method === "DELETE") return deleteShippingMethod(ctx, id);
 			return json({ error: "Method not allowed" }, 405);
 		},
 	},
 	"admin/shipping/classes": {
 		handler: async (routeCtx: RouteContext, _c?: PluginContext) => {
 			const ctx = getCtx(routeCtx, _c);
-			if (routeCtx.request.method === "POST")
-				return postShippingClass(ctx, routeCtx);
+			if (routeCtx.request.method === "POST") return postShippingClass(ctx, routeCtx);
 			return json({ error: "Method not allowed" }, 405);
 		},
 	},
@@ -1738,10 +1731,8 @@ export const adminApiRoutes = {
 			const ctx = getCtx(routeCtx, _c);
 			const id = queryOrPath(routeCtx.request, "id", "classes");
 			if (!id) return json({ error: "Missing class id" }, 400);
-			if (routeCtx.request.method === "PATCH")
-				return patchShippingClass(ctx, id, routeCtx);
-			if (routeCtx.request.method === "DELETE")
-				return deleteShippingClass(ctx, id);
+			if (routeCtx.request.method === "PATCH") return patchShippingClass(ctx, id, routeCtx);
+			if (routeCtx.request.method === "DELETE") return deleteShippingClass(ctx, id);
 			return json({ error: "Method not allowed" }, 405);
 		},
 	},
@@ -1782,9 +1773,7 @@ export const adminApiRoutes = {
 			const parts = pathParts(routeCtx.request);
 			const subIdx = parts.lastIndexOf("subscriptions");
 			const id =
-				url.searchParams.get("id") ??
-				input.id ??
-				(subIdx !== -1 ? parts[subIdx + 1] : undefined);
+				url.searchParams.get("id") ?? input.id ?? (subIdx !== -1 ? parts[subIdx + 1] : undefined);
 			const action =
 				url.searchParams.get("action") ??
 				input.action ??
@@ -1869,8 +1858,7 @@ export const adminApiRoutes = {
 			reportTopCustomers(getCtx(routeCtx, _c), routeCtx.request),
 	},
 	"admin/reports/mrr": {
-		handler: async (routeCtx: RouteContext, _c?: PluginContext) =>
-			reportMrr(getCtx(routeCtx, _c)),
+		handler: async (routeCtx: RouteContext, _c?: PluginContext) => reportMrr(getCtx(routeCtx, _c)),
 	},
 
 	// Widgets
@@ -1912,9 +1900,7 @@ export const adminApiRoutes = {
 						delete body[k];
 					}
 				}
-				const currentEnabled = await ctx.kv.get<string[]>(
-					"settings:enabledCurrencies",
-				);
+				const currentEnabled = await ctx.kv.get<string[]>("settings:enabledCurrencies");
 				const report = validateSettings(body, {
 					currentEnabledCurrencies: currentEnabled ?? undefined,
 				});
@@ -1966,10 +1952,7 @@ export const adminApiRoutes = {
 					payoutsEnabled: !!account.payouts_enabled,
 				});
 			} catch (err) {
-				return json(
-					{ ok: false, error: err instanceof Error ? err.message : "Ping failed" },
-					502,
-				);
+				return json({ ok: false, error: err instanceof Error ? err.message : "Ping failed" }, 502);
 			}
 		},
 	},

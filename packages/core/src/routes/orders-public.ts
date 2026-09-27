@@ -21,10 +21,11 @@
  */
 
 import type { PluginContext, RouteContext, StorageCollection } from "emdash";
-import type { Order, OrderItem } from "../types";
+import { finalizePaystack } from "../orders/paystack";
+import { resolvePaystackKey } from "../payment-provider";
+import { attemptForDraft, attemptMode, reconcileAttempt } from "../payment-provider/paystack-test";
+import type { Order, OrderItem, PaymentRecord } from "../types";
 import { draftKey } from "./checkout";
-import { attemptForDraft, reconcileAttempt, testKey } from "../payment-provider/paystack-test";
-import { finalizePaystackTest } from "../orders/paystack";
 
 type OrdersStore = StorageCollection<Order>;
 type OrderItemsStore = StorageCollection<OrderItem>;
@@ -72,11 +73,12 @@ export const ordersPublicRoutes = {
 			if (attempt) {
 				let current = attempt;
 				try {
-					const key = await ctx.kv.get<string>("settings:paystackSecretKey");
-					testKey(key);
-					current = await reconcileAttempt(ctx, key, attempt);
+					if (current.outcome !== "verified") {
+						const key = await resolvePaystackKey(ctx, attempt);
+						current = await reconcileAttempt(ctx, key, attempt);
+					}
 					if (current.outcome === "verified") {
-						const { order } = await finalizePaystackTest(ctx, current);
+						const { order } = await finalizePaystack(ctx, current);
 						const items = (
 							await orderItemsStore(ctx).query({ where: { orderId: order.id }, limit: 100 })
 						).items.map((r) => ({ ...r.data, id: r.id }));
@@ -84,8 +86,10 @@ export const ordersPublicRoutes = {
 							status: "ready",
 							order,
 							items,
-							testMode: true,
-							manualReview: order.metadata?.inventoryStatus === "manual_review",
+							testMode: attemptMode(current) === "test",
+							manualReview:
+								order.metadata?.inventoryStatus === "manual_review" ||
+								order.metadata?.couponStatus === "manual_review",
 						});
 					}
 					return json({
@@ -95,18 +99,47 @@ export const ordersPublicRoutes = {
 								: current.outcome === "manual_review"
 									? "manual_review"
 									: "pending",
-						testMode: true,
+						testMode: attemptMode(current) === "test",
 					});
 				} catch (err) {
-					ctx.log.warn("Test payment verification/finalization deferred", {
+					ctx.log.warn("Payment verification/finalization deferred", {
 						error: err instanceof Error ? err.message : String(err),
 					});
-					return json({ status: "pending", retryable: true, testMode: true });
+					return json({
+						status: "pending",
+						retryable: true,
+						testMode: attemptMode(attempt) === "test",
+					});
 				}
 			}
-			// Query by metadata.orderDraftId — not a first-class index, so we
-			// scan the most recent 200 orders (enough for any realistic race
-			// window between Stripe confirm + webhook + page poll).
+			// New shared payments have an indexed draft identity. Receipts must
+			// keep working after the order leaves the recent-order window.
+			const journal = await (
+				ctx.storage as unknown as { payments: StorageCollection<PaymentRecord> }
+			).payments.query({ where: { orderDraftId }, limit: 2 });
+			if (journal.items.length > 1) return json({ status: "manual_review" });
+			const payment = journal.items[0]?.data;
+			if (payment) {
+				if (payment.status !== "finalized" && payment.status !== "finalized_test")
+					return json({ status: "pending" });
+				const order = await ordersStore(ctx).get(payment.orderId);
+				if (!order || order.metadata?.orderDraftId !== orderDraftId)
+					return json({ status: "manual_review" });
+				const items = (
+					await orderItemsStore(ctx).query({ where: { orderId: order.id }, limit: 200 })
+				).items.map((row) => ({ ...row.data, id: row.id }));
+				return json({
+					status: "ready",
+					order,
+					items,
+					...(payment.mode ? { mode: payment.mode, testMode: payment.mode === "test" } : {}),
+					manualReview:
+						order.metadata?.inventoryStatus === "manual_review" ||
+						order.metadata?.couponStatus === "manual_review",
+				});
+			}
+			// Read-only compatibility for old, journal-less orders. Historical
+			// stores need an explicit migration rather than an unbounded scan.
 			const recent = await ordersStore(ctx).query({
 				orderBy: { createdAt: "desc" },
 				limit: 200,
@@ -117,6 +150,23 @@ export const ordersPublicRoutes = {
 			});
 			if (match) {
 				const order = { ...(match.data as Order), id: match.id };
+				// New orders become visible only after the shared finalizer commits its
+				// last marker. Pre-journal legacy orders remain readable.
+				if (order.paymentReference) {
+					const payment = await (
+						ctx.storage as unknown as {
+							payments: StorageCollection<PaymentRecord>;
+						}
+					).payments.get(order.id);
+					if (
+						payment?.status !== "finalized" &&
+						!(
+							payment?.status === "finalized_test" &&
+							order.paymentReference.startsWith("paystack-test:")
+						)
+					)
+						return json({ status: "pending" });
+				}
 				const items = (
 					await orderItemsStore(ctx).query({
 						where: { orderId: order.id },
@@ -127,8 +177,8 @@ export const ordersPublicRoutes = {
 			}
 
 			// No order yet — is the draft snapshot still around?
-			const snapshot = await ctx.kv.get<unknown>(draftKey(orderDraftId));
-			if (!snapshot) {
+			const snapshot = await ctx.kv.get<{ failed?: boolean }>(draftKey(orderDraftId));
+			if (!snapshot || snapshot.failed === true) {
 				return json({ status: "failed" });
 			}
 			return json({ status: "pending" });

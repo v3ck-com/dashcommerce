@@ -26,18 +26,14 @@ import { MoneyDisplay } from "../ui/MoneyDisplay";
 import { StatusBadge } from "../ui/StatusBadge";
 import { EmptyState } from "../ui/EmptyState";
 import type { Order, OrderItem, OrderStatus, Refund } from "../../types";
+import { isTestOrder } from "../../util/order-environment";
+import { finishRefundIntent, refundIntentKey, settleRefundIntent } from "../refund-intent";
 
 // Allowed forward transitions mirrored from `../../orders/status.ts` so the
 // UI can hide impossible targets without round-tripping to the server.
 const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
 	pending: ["processing", "on-hold", "cancelled", "failed"],
-	processing: [
-		"completed",
-		"on-hold",
-		"cancelled",
-		"refunded",
-		"partially-refunded",
-	],
+	processing: ["completed", "on-hold", "cancelled", "refunded", "partially-refunded"],
 	"on-hold": ["processing", "cancelled"],
 	completed: ["refunded", "partially-refunded"],
 	cancelled: [],
@@ -46,11 +42,7 @@ const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
 	failed: ["pending", "cancelled"],
 };
 
-const DESTRUCTIVE_STATUSES: ReadonlySet<OrderStatus> = new Set([
-	"cancelled",
-	"refunded",
-	"failed",
-]);
+const DESTRUCTIVE_STATUSES: ReadonlySet<OrderStatus> = new Set(["cancelled", "refunded", "failed"]);
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
 	pending: "Pending",
@@ -127,9 +119,28 @@ export function OrderDetailPage() {
 	return (
 		<div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 			<BackToOrdersLink />
+			{isTestOrder(order) && (
+				<Alert type="warning" title="Test order — no real payment">
+					Use this order to test the workflow only. Do not dispatch goods or treat its amount as
+					live revenue.
+				</Alert>
+			)}
+			{order.metadata?.couponStatus === "manual_review" && (
+				<Alert type="warning" title="Paid order — discount needs review">
+					The reserved coupon capacity was unavailable or its customer identity changed. Review the
+					accepted price before fulfilment, or refund the order. Digital grants were withheld;
+					changing status alone does not issue them.
+				</Alert>
+			)}
+			{order.metadata?.inventoryStatus === "manual_review" && (
+				<Alert type="warning" title="Paid order — inventory needs review">
+					Payment was verified, but stock could not be consumed safely. Resolve stock separately
+					before fulfilment. Automatic refund restocking is unavailable for this order.
+				</Alert>
+			)}
 			<OrderHeader order={order} onChanged={reload} />
 			<ItemsCard items={items} />
-			<RefundCard order={order} items={items} onRefunded={reload} />
+			<RefundCard order={order} items={items} refunds={refunds} onRefunded={reload} />
 			<RefundHistoryCard refunds={refunds} />
 		</div>
 	);
@@ -192,10 +203,7 @@ function OrderHeader({
 			toast.success(`Order moved to ${STATUS_LABEL[next].toLowerCase()}`);
 			await onChanged();
 		} catch (err) {
-			toast.error(
-				"Could not update order",
-				err instanceof Error ? err.message : String(err),
-			);
+			toast.error("Could not update order", err instanceof Error ? err.message : String(err));
 		} finally {
 			setPending(null);
 		}
@@ -229,8 +237,7 @@ function OrderHeader({
 						<strong>Paid:</strong> <MoneyDisplay value={order.paidTotal} />
 					</span>
 					<span>
-						<strong>Refunded:</strong>{" "}
-						<MoneyDisplay value={order.refundedTotal} />
+						<strong>Refunded:</strong> <MoneyDisplay value={order.refundedTotal} />
 					</span>
 				</div>
 				<div style={{ fontSize: 13, color: "#374151" }}>
@@ -278,9 +285,17 @@ function ItemsCard({ items }: { items: OrderItem[] }) {
 							render: (i) => (
 								<>
 									<div>{i.name}</div>
-									<div style={{ fontSize: 12, color: "#6b7280" }}>
-										SKU {i.sku || "—"}
-									</div>
+									{i.customisation && (
+										<dl>
+											{Object.entries(i.customisation).map(([key, value]) => (
+												<div key={key}>
+													<dt>{key.replaceAll("_", " ")}</dt>
+													<dd>{value}</dd>
+												</div>
+											))}
+										</dl>
+									)}
+									<div style={{ fontSize: 12, color: "#6b7280" }}>SKU {i.sku || "—"}</div>
 								</>
 							),
 						},
@@ -313,15 +328,26 @@ function ItemsCard({ items }: { items: OrderItem[] }) {
 function RefundCard({
 	order,
 	items,
+	refunds,
 	onRefunded,
 }: {
 	order: Order;
 	items: OrderItem[];
+	refunds: Refund[];
 	onRefunded: () => Promise<void> | void;
 }) {
 	const api = usePluginAPI();
-	const remainingMinor = order.paidTotal.amount - order.refundedTotal.amount;
+	const reservedMinor = Object.values(order.refundReservations ?? {})
+		.filter((reservation) => reservation.status === "pending")
+		.reduce((sum, reservation) => sum + reservation.amount, 0);
+	const remainingMinor = Math.max(
+		0,
+		order.paidTotal.amount - order.refundedTotal.amount - reservedMinor,
+	);
 	const remainingMajor = remainingMinor / 100;
+	useEffect(() => {
+		settleRefundIntent(window.sessionStorage, order.id, refunds);
+	}, [order.id, refunds]);
 
 	const [amountMajor, setAmountMajor] = useState<number | undefined>(undefined);
 	const [reason, setReason] = useState("");
@@ -348,9 +374,9 @@ function RefundCard({
 		}
 		const ok = await confirm({
 			title: fullRefund ? "Refund the remaining balance?" : "Issue partial refund?",
-			description: fullRefund
-				? "Stripe will return the remaining balance to the customer immediately. This cannot be undone."
-				: "Stripe will return the specified amount to the customer. This cannot be undone.",
+			description: isTestOrder(order)
+				? "Request a test refund through this order's payment provider. No real funds will move."
+				: "Request a refund through this order's payment provider. Completion may be asynchronous; submitting a request does not mean funds have already been returned.",
 			confirmLabel: "Issue refund",
 			destructive: true,
 		});
@@ -358,25 +384,52 @@ function RefundCard({
 
 		setPending(true);
 		try {
-			await api.post(`admin/orders/refund?id=${encodeURIComponent(order.id)}`, {
+			if (restock && (!fullRefund || order.refundedTotal.amount > 0 || reservedMinor > 0))
+				throw new Error(
+					"Automatic restock here requires an untouched full-order refund. Partial or previously refunded orders need item-specific restock quantities.",
+				);
+			const payload = {
 				amount: amt,
 				currency: order.currency,
 				reason: reason || undefined,
 				restock: restock || undefined,
-			});
-			toast.success(
-				fullRefund ? "Full refund issued" : "Refund issued",
-				`${(amt / 100).toFixed(2)} ${order.currency} returned to customer.`,
+				...(restock
+					? {
+							lineItemRefunds: items.map((item) => ({
+								orderItemId: item.id,
+								quantity: item.quantity,
+								amount: item.total.amount,
+								currency: order.currency,
+							})),
+						}
+					: {}),
+			};
+			const idempotencyKey = await refundIntentKey(window.sessionStorage, order.id, payload);
+			const result = await api.post<{ refund: Refund }>(
+				`admin/orders/refund?id=${encodeURIComponent(order.id)}`,
+				{ ...payload, idempotencyKey },
 			);
+			const status = result.refund?.status;
+			if (status === "succeeded" || status === "failed")
+				finishRefundIntent(window.sessionStorage, order.id);
+			if (status === "failed")
+				toast.error(
+					"Refund failed",
+					"The provider has not returned these funds. Check refund history before another request.",
+				);
+			else
+				toast.success(
+					status === "succeeded" ? "Refund confirmed" : "Refund request recorded",
+					status === "succeeded"
+						? `${(amt / 100).toFixed(2)} ${order.currency}${isTestOrder(order) ? " — test transaction only." : " confirmed by the payment provider."}`
+						: "Check refund history for the provider outcome; do not submit a new request while this one is unresolved.",
+				);
 			setAmountMajor(undefined);
 			setReason("");
 			setRestock(false);
 			await onRefunded();
 		} catch (err) {
-			toast.error(
-				"Refund failed",
-				err instanceof Error ? err.message : String(err),
-			);
+			toast.error("Refund failed", err instanceof Error ? err.message : String(err));
 		} finally {
 			setPending(false);
 		}
@@ -385,15 +438,19 @@ function RefundCard({
 	return (
 		<Card title="Issue refund">
 			{remainingMinor <= 0 ? (
-				<Alert type="info" title="No refundable balance">
-					This order has already been fully refunded or never captured
-					payment.
+				<Alert
+					type="info"
+					title={reservedMinor > 0 ? "Refund awaiting confirmation" : "No refundable balance"}
+				>
+					{reservedMinor > 0
+						? "Pending or uncertain requests reserve the remaining balance; funds are not yet confirmed returned. Use Payment operations to check the existing request."
+						: "This order has already been fully refunded or never captured payment."}
 				</Alert>
 			) : (
 				<div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
 					<div style={{ fontSize: 13, color: "#374151" }}>
-						Up to <MoneyDisplay value={{ ...order.paidTotal, amount: remainingMinor }} /> can
-						still be refunded.
+						Up to <MoneyDisplay value={{ ...order.paidTotal, amount: remainingMinor }} /> can still
+						be refunded.
 					</div>
 					<div
 						style={{
@@ -431,11 +488,7 @@ function RefundCard({
 						/>
 					)}
 					<div style={{ display: "flex", gap: 8 }}>
-						<Button
-							variant="danger"
-							disabled={pending || !amountMajor}
-							onClick={issueRefund}
-						>
+						<Button variant="danger" disabled={pending || !amountMajor} onClick={issueRefund}>
 							{pending ? "Refunding…" : "Issue refund"}
 						</Button>
 						<Button

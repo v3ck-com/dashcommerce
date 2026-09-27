@@ -17,13 +17,23 @@ interface Order {
 	status: string;
 	paymentStatus?: string;
 	paymentProvider?: string;
+	paymentMode?: "test" | "live";
 	customerEmail: string;
 	total: Money;
+	refundedTotal?: Money;
+	refundReservations?: Record<string, { amount: number; status: string }>;
 	currency: string;
 	metadata?: Record<string, unknown>;
 }
-type PollResponse =
-	| { status: "ready"; order: Order; items: Item[]; testMode?: boolean; manualReview?: boolean }
+export type PollResponse =
+	| {
+			status: "ready";
+			order: Order;
+			items: Item[];
+			mode?: "test" | "live";
+			testMode?: boolean;
+			manualReview?: boolean;
+	  }
 	| { status: "pending" }
 	| { status: "failed" }
 	| { status: "manual_review" };
@@ -44,17 +54,41 @@ function formatMoney(m: Money, locale = "en-US") {
 	}
 }
 
+export function hasConfirmedPayment(status?: string): boolean {
+	return ["paid", "refunded", "partially-refunded"].includes(status ?? "");
+}
+
 function optionLabel(key: string) {
 	const spaced = key.replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2");
 	return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
-function isTestOrder(result: Extract<PollResponse, { status: "ready" }>) {
-	return (
-		result.testMode === true ||
-		result.order.paymentProvider === "paystack-test" ||
-		result.order.metadata?.testMode === true
-	);
+function paymentModes(result: Extract<PollResponse, { status: "ready" }>): Set<"test" | "live"> {
+	const modes = new Set<"test" | "live">();
+	const add = (value: unknown) => {
+		if (value === "test" || value === "live") modes.add(value);
+	};
+	add(result.mode);
+	add(result.order.paymentMode);
+	add(result.order.metadata?.paymentMode);
+	add(result.order.metadata?.mode);
+	if (typeof result.testMode === "boolean") add(result.testMode ? "test" : "live");
+	if (typeof result.order.metadata?.testMode === "boolean") {
+		add(result.order.metadata.testMode ? "test" : "live");
+	}
+	if (result.order.paymentProvider === "paystack-test") add("test");
+	return modes;
+}
+
+export function hasPaymentModeConflict(
+	result: Extract<PollResponse, { status: "ready" }>,
+): boolean {
+	const modes = paymentModes(result);
+	return modes.size > 1 || (result.order.paymentProvider === "paystack" && modes.size === 0);
+}
+
+export function isTestOrder(result: Extract<PollResponse, { status: "ready" }>): boolean {
+	return paymentModes(result).has("test");
 }
 
 export default function OrderSummaryIsland({
@@ -92,7 +126,7 @@ export default function OrderSummaryIsland({
 				setResult(body);
 				if (body.status === "failed" || body.status === "manual_review") return;
 				if (body.status === "ready") {
-					if (body.order.paymentStatus === "paid") {
+					if (hasConfirmedPayment(body.order.paymentStatus)) {
 						notifyCart();
 						return;
 					}
@@ -147,7 +181,7 @@ export default function OrderSummaryIsland({
 		!result ||
 		result.status === "pending" ||
 		(result.status === "ready" &&
-			result.order.paymentStatus !== "paid" &&
+			!hasConfirmedPayment(result.order.paymentStatus) &&
 			result.order.paymentStatus !== "failed")
 	) {
 		return (
@@ -170,28 +204,62 @@ export default function OrderSummaryIsland({
 		);
 	}
 
+	if (hasPaymentModeConflict(result)) {
+		return (
+			<div role="alert">
+				<h2>Payment details need review</h2>
+				<p>
+					The payment environment could not be confirmed consistently. Do not start another payment;
+					contact the shop with this private reference:
+				</p>
+				<code>{orderDraftId}</code>
+			</div>
+		);
+	}
+
 	const { order, items } = result;
 	const testMode = isTestOrder(result);
+	const refunded =
+		order.paymentStatus === "refunded" || order.paymentStatus === "partially-refunded";
+	const pendingRefund = Object.values(order.refundReservations ?? {}).some(
+		(entry) => entry.status === "pending",
+	);
 	return (
 		<section className={`dc-order-summary${testMode ? " dc-order-summary--test" : ""}`}>
 			{testMode && <div className="dc-test-badge">TEST MODE · NO REAL PAYMENT</div>}
-			<h2>{testMode ? "Test payment verified" : "Payment confirmed"}</h2>
+			<h2>
+				{refunded
+					? `${testMode ? "Test payment" : "Payment"} ${order.paymentStatus === "refunded" ? "refunded" : "partially refunded"}`
+					: testMode
+						? "Test payment verified"
+						: "Payment confirmed"}
+			</h2>
 			<p>
 				Order <strong>#{order.orderNumber}</strong>
 			</p>
 			{testMode ? (
 				<p>
-					This is a preview receipt for a verified Paystack test transaction. No real money moved
-					and no receipt email was sent.
+					This is a preview receipt for a verified test transaction. No real money moved and no
+					receipt email was sent.
 				</p>
 			) : (
 				<p>
-					Your paid order is confirmed for <strong>{order.customerEmail}</strong>.
+					{refunded ? "A refund is confirmed for" : "Payment was confirmed for"}{" "}
+					<strong>{order.customerEmail}</strong>.
 				</p>
+			)}
+			<p>Order status: {order.status.replace(/[-_]/g, " ")}</p>
+			{refunded && order.refundedTotal && (
+				<p>Confirmed refund: {formatMoney(order.refundedTotal)}</p>
+			)}
+			{pendingRefund && (
+				<p>A refund request is awaiting confirmation. No additional refund has been confirmed.</p>
 			)}
 			{result.manualReview && (
 				<p role="alert">
-					Stock needs manual review. This order is on hold and will not be automatically fulfilled.
+					{order.metadata?.couponStatus === "manual_review"
+						? "The discount needs manual review. Payment was confirmed, but this order is on hold and will not be automatically fulfilled."
+						: "Stock needs manual review. This order is on hold and will not be automatically fulfilled."}
 				</p>
 			)}
 			<ul>

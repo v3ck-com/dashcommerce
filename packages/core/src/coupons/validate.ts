@@ -1,193 +1,160 @@
-/**
- * Coupon validation + discount resolution.
- *
- * A coupon is applicable to a cart iff:
- *   - `status === "active"`
- *   - Within `startsAt`/`endsAt` window (or those fields absent)
- *   - `minAmount` ≤ cart.subtotal ≤ `maxAmount` (currency-matched)
- *   - Currency scope matches (for fixed-amount types)
- *   - At least one cart line matches product/category inclusion filters
- *   - No excluded products/categories are in cart (only a hard block if
- *     `individualUse` applies; otherwise they're skipped during resolve)
- *   - Global `usageLimit` not exceeded
- *   - Per-customer `usageLimitPerCustomer` not exceeded (caller passes count)
- *   - If `individualUse`, cart has no other coupons
- *
- * Discount resolution returns the `Money` value to subtract from cart total.
- */
+/** Coupon validation + authoritative, per-line discount resolution. */
 
+import { allocateDiscountAcrossLines, remainingLineBalances } from "../cart/calculate";
 import { money, percent as pct, type Money, zero, CurrencyMismatchError } from "../money";
-import type { AppliedCoupon, CartState, Coupon, DiscountType } from "../types";
+import type { AppliedCoupon, CartLineItem, CartState, Coupon, DiscountType } from "../types";
 
 export interface CouponValidationContext {
 	cart: CartState;
-	/**
-	 * Slugs of categories attached to each product in cart, keyed by productId.
-	 * Plugin's caller is responsible for populating this via `ctx.content`.
-	 */
+	/** Slugs of categories keyed by product ID. */
 	productCategories?: Record<string, string[]>;
 	/** Usage count for this coupon by this customer (0 for guest). */
 	usageByCustomer?: number;
 }
 
-export type ValidationResult =
-	| { ok: true }
-	| { ok: false; reason: string };
+export type ValidationResult = { ok: true } | { ok: false; reason: string };
 
-export function validateCoupon(
-	coupon: Coupon,
-	ctx: CouponValidationContext,
-): ValidationResult {
+export function validateCoupon(coupon: Coupon, ctx: CouponValidationContext): ValidationResult {
 	const { cart } = ctx;
-
 	if (coupon.status !== "active") return { ok: false, reason: "Coupon inactive." };
 
 	const now = Date.now();
-	if (coupon.startsAt && Date.parse(coupon.startsAt) > now) {
+	if (coupon.startsAt && Date.parse(coupon.startsAt) > now)
 		return { ok: false, reason: "Coupon not yet active." };
-	}
-	if (coupon.endsAt && Date.parse(coupon.endsAt) < now) {
+	if (coupon.endsAt && Date.parse(coupon.endsAt) < now)
 		return { ok: false, reason: "Coupon expired." };
-	}
-
-	// Currency scope: fixed_* requires an explicit currency matching the cart
 	if (
 		(coupon.discountType === "fixed_cart" || coupon.discountType === "fixed_product") &&
 		coupon.currency &&
 		coupon.currency !== cart.currency
 	) {
-		return {
-			ok: false,
-			reason: `Coupon is in ${coupon.currency}; cart is in ${cart.currency}.`,
-		};
+		return { ok: false, reason: `Coupon is in ${coupon.currency}; cart is in ${cart.currency}.` };
 	}
-
-	if (coupon.minAmount && cart.subtotal.amount < coupon.minAmount.amount) {
+	if (coupon.minAmount && cart.subtotal.amount < coupon.minAmount.amount)
 		return { ok: false, reason: "Cart subtotal below coupon minimum." };
-	}
-	if (coupon.maxAmount && cart.subtotal.amount > coupon.maxAmount.amount) {
+	if (coupon.maxAmount && cart.subtotal.amount > coupon.maxAmount.amount)
 		return { ok: false, reason: "Cart subtotal above coupon maximum." };
-	}
-
-	if (coupon.usageLimit !== undefined && coupon.usageCount >= coupon.usageLimit) {
+	if (coupon.usageLimit !== undefined && coupon.usageCount >= coupon.usageLimit)
 		return { ok: false, reason: "Coupon usage limit reached." };
-	}
 	if (
 		coupon.usageLimitPerCustomer !== undefined &&
 		ctx.usageByCustomer !== undefined &&
 		ctx.usageByCustomer >= coupon.usageLimitPerCustomer
-	) {
+	)
 		return { ok: false, reason: "You have already used this coupon." };
-	}
-
-	if (coupon.individualUse && cart.coupons.length > 0) {
+	if (coupon.individualUse && cart.coupons.length > 0)
 		return { ok: false, reason: "This coupon cannot be combined with others." };
-	}
-	if (!coupon.individualUse && cart.coupons.some((c) => c.code === coupon.code)) {
+	if (!coupon.individualUse && cart.coupons.some((applied) => applied.code === coupon.code))
 		return { ok: false, reason: "Coupon already applied." };
-	}
 
-	const hasProductFilter = Boolean(
-		coupon.includedProductIds?.length || coupon.includedCategorySlugs?.length,
+	const hasExcludedItem = cart.items.some((item) =>
+		itemExcluded(coupon, item, ctx.productCategories),
 	);
-	if (hasProductFilter) {
-		const anyMatch = cart.items.some((item) => {
-			if (coupon.includedProductIds?.includes(item.productId)) return true;
-			if (coupon.includedCategorySlugs && ctx.productCategories) {
-				const cats = ctx.productCategories[item.productId] ?? [];
-				return cats.some((c) => coupon.includedCategorySlugs?.includes(c));
-			}
-			return false;
-		});
-		if (!anyMatch) {
-			return { ok: false, reason: "Coupon does not apply to any item in cart." };
-		}
-	}
+	if (hasExcludedItem) return { ok: false, reason: "Coupon excludes an item in this cart." };
 
+	if (
+		hasProductFilter(coupon) &&
+		!cart.items.some((item) => itemIncluded(coupon, item, ctx.productCategories))
+	)
+		return { ok: false, reason: "Coupon does not apply to any item in cart." };
 	return { ok: true };
 }
 
-function eligibleItemsSubtotal(
+function hasProductFilter(coupon: Coupon): boolean {
+	return Boolean(coupon.includedProductIds?.length || coupon.includedCategorySlugs?.length);
+}
+
+function itemExcluded(
 	coupon: Coupon,
-	cart: CartState,
+	item: CartLineItem,
 	productCategories?: Record<string, string[]>,
-): Money {
-	const cc = cart.currency;
-	let total = 0;
-	for (const item of cart.items) {
-		if (coupon.excludedProductIds?.includes(item.productId)) continue;
-		if (
-			coupon.excludedCategorySlugs &&
-			productCategories &&
-			(productCategories[item.productId] ?? []).some((c) =>
-				coupon.excludedCategorySlugs?.includes(c),
-			)
-		) {
-			continue;
-		}
-		// If inclusion filters exist, limit to matching items only
-		if (coupon.includedProductIds?.length || coupon.includedCategorySlugs?.length) {
-			const include =
-				coupon.includedProductIds?.includes(item.productId) ||
-				(coupon.includedCategorySlugs &&
-					productCategories &&
-					(productCategories[item.productId] ?? []).some((c) =>
-						coupon.includedCategorySlugs?.includes(c),
-					));
-			if (!include) continue;
-		}
-		total += item.lineSubtotal.amount;
-	}
-	return money(cc, total);
+): boolean {
+	return (
+		coupon.excludedProductIds?.includes(item.productId) === true ||
+		(coupon.excludedCategorySlugs?.length !== undefined &&
+			(productCategories?.[item.productId] ?? []).some((category) =>
+				coupon.excludedCategorySlugs?.includes(category),
+			))
+	);
+}
+
+function itemIncluded(
+	coupon: Coupon,
+	item: CartLineItem,
+	productCategories?: Record<string, string[]>,
+): boolean {
+	if (itemExcluded(coupon, item, productCategories)) return false;
+	if (!hasProductFilter(coupon)) return true;
+	return (
+		coupon.includedProductIds?.includes(item.productId) === true ||
+		(productCategories?.[item.productId] ?? []).some((category) =>
+			coupon.includedCategorySlugs?.includes(category),
+		)
+	);
+}
+
+function subtotal(items: CartLineItem[], currency: string): Money {
+	return money(
+		currency,
+		items.reduce((total, item) => total + item.lineSubtotal.amount, 0),
+	);
 }
 
 /**
- * Compute the `AppliedCoupon` entry that should be placed on the cart.
- * Throws `CurrencyMismatchError` when the coupon currency does not match.
+ * Resolve a coupon into its durable, per-line allocation. Product coupons use
+ * only eligible product balances; cart coupons intentionally spread across the
+ * entire remaining cart balance. Earlier coupons are never overdrawn.
  */
 export function resolveDiscount(
 	coupon: Coupon,
 	cart: CartState,
 	productCategories?: Record<string, string[]>,
 ): AppliedCoupon {
-	const cc = cart.currency;
-
-	// Currency check for fixed-value coupons
+	const currency = cart.currency;
 	if (
 		(coupon.discountType === "fixed_cart" || coupon.discountType === "fixed_product") &&
 		coupon.currency &&
-		coupon.currency !== cc
-	) {
-		throw new CurrencyMismatchError(coupon.currency, cc);
-	}
+		coupon.currency !== currency
+	)
+		throw new CurrencyMismatchError(coupon.currency, currency);
 
 	const discountType: DiscountType = coupon.discountType;
-	const eligibleSubtotal = eligibleItemsSubtotal(coupon, cart, productCategories);
+	if (discountType === "free_shipping")
+		return {
+			code: coupon.code,
+			couponId: coupon.id,
+			discountAmount: zero(currency),
+			freeShipping: true,
+			lineDiscounts: {},
+		};
 
-	let discountAmount: Money;
-	let freeShipping = false;
-
-	switch (discountType) {
-		case "percent_cart":
-			discountAmount = pct(cart.subtotal, coupon.discountValue);
-			break;
-		case "fixed_cart":
-			discountAmount = money(cc, Math.min(coupon.discountValue, cart.subtotal.amount));
-			break;
-		case "percent_product":
-			discountAmount = pct(eligibleSubtotal, coupon.discountValue);
-			break;
-		case "fixed_product":
-			discountAmount = money(
-				cc,
-				Math.min(coupon.discountValue, eligibleSubtotal.amount),
-			);
-			break;
-		case "free_shipping":
-			discountAmount = zero(cc);
-			freeShipping = true;
-			break;
-	}
-
-	return { code: coupon.code, discountAmount, freeShipping };
+	const productScoped = discountType === "percent_product" || discountType === "fixed_product";
+	const eligible = productScoped
+		? cart.items.filter((item) => itemIncluded(coupon, item, productCategories))
+		: cart.items;
+	const balances = remainingLineBalances(cart);
+	const eligibleBalance = eligible.reduce(
+		(total, item) => total + Math.max(0, balances[item.lineId] ?? 0),
+		0,
+	);
+	const requested =
+		discountType === "percent_cart" || discountType === "percent_product"
+			? pct(money(currency, eligibleBalance), coupon.discountValue).amount
+			: Math.min(coupon.discountValue, eligibleBalance);
+	const lineDiscounts = allocateDiscountAcrossLines(
+		eligible.map((item) => ({ lineId: item.lineId, capacity: balances[item.lineId] ?? 0 })),
+		requested,
+		currency,
+	);
+	const discountAmount = subtotal(
+		eligible.map((item) => ({ ...item, lineSubtotal: lineDiscounts[item.lineId]! })),
+		currency,
+	);
+	return {
+		code: coupon.code,
+		couponId: coupon.id,
+		discountAmount,
+		freeShipping: false,
+		lineDiscounts,
+	};
 }

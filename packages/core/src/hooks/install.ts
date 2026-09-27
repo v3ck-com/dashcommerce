@@ -15,16 +15,12 @@
  */
 
 import type { PluginContext } from "emdash";
-import { ABANDONED_CART_SCAN, SWEEP_STOCK_LOCKS } from "./cron";
+import { ABANDONED_CART_SCAN, PAYMENT_OPERATIONS_SCAN, SWEEP_STOCK_LOCKS } from "./cron";
 
 /** Event is the empty LifecycleEvent. */
 export interface LifecycleEvent {}
 
-async function setIfMissing<T>(
-	ctx: PluginContext,
-	key: string,
-	value: T,
-): Promise<void> {
+async function setIfMissing<T>(ctx: PluginContext, key: string, value: T): Promise<void> {
 	const current = await ctx.kv.get<T>(key);
 	if (current === null || current === undefined) {
 		await ctx.kv.set(key, value);
@@ -101,6 +97,7 @@ async function scheduleCronTasks(ctx: PluginContext): Promise<void> {
 	try {
 		await ctx.cron.schedule(SWEEP_STOCK_LOCKS, { schedule: "*/5 * * * *" });
 		await ctx.cron.schedule(ABANDONED_CART_SCAN, { schedule: "0 * * * *" });
+		await ctx.cron.schedule(PAYMENT_OPERATIONS_SCAN, { schedule: "*/10 * * * *" });
 	} catch (err) {
 		ctx.log.warn("Cron schedule registration failed", {
 			error: err instanceof Error ? err.message : String(err),
@@ -108,10 +105,7 @@ async function scheduleCronTasks(ctx: PluginContext): Promise<void> {
 	}
 }
 
-export async function onInstall(
-	_event: LifecycleEvent,
-	ctx: PluginContext,
-): Promise<void> {
+export async function onInstall(_event: LifecycleEvent, ctx: PluginContext): Promise<void> {
 	// Store + currency defaults.
 	await setIfMissing(ctx, "settings:defaultCurrency", "USD");
 	await setIfMissing(ctx, "settings:enabledCurrencies", ["USD"]);
@@ -165,10 +159,7 @@ export async function onInstall(
  * operator inputs aren't touched here — only the periodic jobs, which
  * are idempotent in emdash's scheduler.
  */
-export async function onActivate(
-	_event: LifecycleEvent,
-	ctx: PluginContext,
-): Promise<void> {
+export async function onActivate(_event: LifecycleEvent, ctx: PluginContext): Promise<void> {
 	await scheduleCronTasks(ctx);
 	ctx.log.debug("DashCommerce activated.");
 }

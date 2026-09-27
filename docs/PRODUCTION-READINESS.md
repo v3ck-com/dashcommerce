@@ -1,47 +1,56 @@
 # Production readiness
 
-Status: **not ready for production**. The production implementation is the target; the existing test-only implementation is the starting point, not the finished product.
+## Implementation versus activation
 
-## Scope and activation
+**Normal Paystack test/live gateway code is implemented alongside Stripe. Production provider acceptance and deployment approval remain outstanding.** This is not a test-only gateway, but passing intercepted fixtures is not proof that a real merchant account, webhook ingress or payment/refund journey works.
 
-Initial certification target: single-store Paystack hosted checkout, ZAR, personalised physical products, EmDash 0.41, standalone Node and SQLite. Wider platform/provider compatibility needs separate evidence. Existing Stripe paths must be isolated or validated before certification; choosing Paystack must not silently invoke Stripe operations.
+The implementation reuses configurable products/variants, shipping, tax, coupons, inventory, orders and notifications. Merchant VAT, courier and email decisions were not prerequisites to implementing compatibility. Actual store configuration and go-live authorization remain separate from plugin development.
 
-Implement production-capable code separately from activation. Do not enable live payments, send real email, migrate the existing shop, change DNS or deploy without approval. Keep Yoco/Resend delivery mocked and newsletters excluded under the current operating instructions. A production email transport, if built, remains disabled until approved.
+## Implemented and locally exercised
 
-## Required acceptance gates
+| Area | Current behavior |
+| --- | --- |
+| Provider/mode | Normal Paystack with separate encrypted test/live secrets; immutable persisted environment; legacy test alias retained. |
+| Payment proof | Exact-byte webhook authentication plus independent provider verification; bounded transport; durable initialization identity; no blind replay of an uncertain POST. |
+| Orders | Shared recoverable Stripe/Paystack finalization; final journal marker last; deterministic rows; indexed receipt lookup; newer cart edits survive cleanup. |
+| Pricing | Authoritative product/variant prices, weights and categories; native shipping zones/rates; flat/table tax and product classes; deterministic eligible-line discounts. |
+| Coupons | Live quota admission before initialization; same-coupon-row CAS commits usage/customer counters and order identity; bounded legacy hydration; code aliases/stable IDs; test isolation. Lost claims produce paid, held orders without grants. |
+| Inventory | Separate test/live CAS projections; finite/untracked/backorder handling; idempotent consume/restock; explicit, stale-preview-safe CMS adoption. |
+| Refunds | Full/partial pending accounting; amount and per-item quantity reservations before POST; persisted browser intent; provider-ID uniqueness; unknown-response recovery; incomplete effects replay; independently verified external Paystack refunds. |
+| Operations | Native private authenticated pages/actions, bounded scheduled reconciliation, persisted pagination cursors and explicit recovery states. No customer return is required to run recovery. |
+| Notifications | Durable order/refund outbox; opt-in native email; test suppression; uncertain delivery is not automatically retried. |
+| UI | Normal test/live gateway selection; truthful pending/paid/held/refund states; personalisation retained; test warnings; private refund/recovery controls. |
 
-Every unchecked gate blocks a production-ready claim. Passing fixture tests alone is insufficient.
+Ordinary Stripe flows share accounting and finalization without claiming that Stripe subscriptions, Connect, Elements or Stripe Tax are interchangeable with Paystack. Stripe card declines retain their bounded reservation while the PaymentIntent remains retryable; terminal cancellation releases it. Stripe Tax totals are checked against provider proof without inventing a tax rate.
 
-- [ ] **Mode separation:** explicit test/live configuration; match credential mode and provider transaction domain; persist immutable mode on attempts, payments, refunds and outbox records. No fallback between environments. Preserve historical test data without relabelling it as live.
-- [ ] **Payment lifecycle:** durable initialization, verification, webhook processing, expiry, late success and reversal handling. Recover uncertain requests through reconciliation rather than blind repeated financial calls. Authenticate and audit operator interventions.
-- [ ] **Reconciliation:** scheduled provider verification with bounded retries/backoff, persistent work state, operator queue and alerts. Recovery must not depend on a customer revisiting a receipt page.
-- [ ] **Refunds:** provider-neutral durable requests, partial/full amount accounting, concurrent refund limits, ambiguous-response recovery and provider status reconciliation. Restock only under explicit policy; payment success and refund completion are separate states.
-- [ ] **Inventory:** one authoritative accounting path with atomic reservations/consumption/restocking, safe expiry and returns, operator adjustments and reconciliation UI. Verify multi-process contention and crash recovery. Resolve legacy Stripe/CMS projection conflicts.
-- [ ] **Order operations:** accurate paid/held/fulfilment states, administrative authorization, audit history, explicit transitions and usable personalisation details. No automatic shipping from unverified or review-required payments.
-- [ ] **Notifications:** durable independently retryable outbox, deduplication, delivery failure visibility, explicit test/live separation and approved sender configuration. Preview records are not delivered receipts.
-- [ ] **Checkout rules:** merchant-approved shipping destinations/rates, tax treatment and discount policy. Revalidate before payment and preserve the purchase snapshot. Unsupported rules must fail clearly, never produce invented totals.
-- [ ] **Security/privacy:** administrator flows, secret encryption/rotation/redaction, webhook key rotation, cookie/proxy/CSRF handling, bounded requests, abuse limits, private capabilities, PII retention/deletion and dependency review.
-- [ ] **Operations:** deployment configuration, HTTPS/webhook ingress, health/readiness checks, supervised background work, alerting, backups and demonstrated restore/rollback. Test the actual intended hosting/storage topology.
-- [ ] **Migration:** non-destructive catalogue/options migration and comparison of prices, URLs, media and stock. Explicit decision on customer/order history, with backup and rollback evidence before applying anything to the existing shop.
-- [ ] **Provider acceptance:** real Paystack sandbox-account hosted checkout, webhook, refund and recovery exercises with synthetic customers. Offline fixtures remain required regression tests, but cannot replace this gate.
-- [ ] **Independent final review:** clean CI and reproducible acceptance evidence for the release candidate, including adversarial/concurrency/failure tests and merchant sign-off. No production claim based only on unit-test totals.
+## Explicit compatibility limits
 
-## Implementation order
+- Paystack subscriptions/vendor splits/Stripe Tax/Elements are unsupported and fail closed rather than being silently approximated.
+- Nonempty flat-rate `shippingClassRates` are unavailable because mixed-class aggregation was never defined. Base-rate fallback would silently undercharge.
+- Paystack zero-total/free-order checkout is not implemented. Currency/account capability still requires real provider acceptance; integrated fixtures cover ZAR.
+- Text personalisation is supported; conditional builders, paid extras and uploads are not.
+- Test projections never consume or restore live stock. Test financial records do not consume coupon quotas, contribute live financial aggregates, create digital grants or deliver email.
+- Lost inventory/coupon capacity is an explicit manual-review hold, not automatic fulfilment or an automatic refund. Changing order status alone does not issue withheld download grants.
+- An unknown financial POST without independently verifiable provider identity cannot safely be retried or declared failed. Operators must obtain provider evidence; there is no unsafe force-resend action.
+- Provider dispute/chargeback and payout accounting are not automated by these ordinary payment/refund flows; monitor the provider account separately.
+- Email delivery is at-most-one automatic handoff attempt, not exactly-once delivery. `sending`/`uncertain` require inspection.
+- Reconciliation is bounded periodic scanning, not a deployment alerting service or an adaptive retry scheduler. The Node scheduler requires a running supervised process.
+- Legacy unmarked/pre-journal orders and old CMS inventory effects need audited migration/reconciliation. Large legacy coupon histories fail closed beyond bounded hydration. No automatic legacy stock reconstruction is claimed.
+- Stock and coupon accounting records are not a high-volume partitioned system. Retention/erasure and operational capacity need deployment-specific review.
 
-1. Audit and mode/provider-neutral payment model; compatibility/migration tests.
-2. Reconciliation and refund state machines; inventory integration and operator tools.
-3. Order fulfilment controls, notification transport/outbox and browser/admin journeys.
-4. Abuse/privacy controls, deployment/backup/restore tooling and non-destructive shop migration rehearsal.
-5. Real sandbox-account validation, independent review and merchant acceptance; separate go-live approval.
+## Evidence and remaining acceptance
 
-## Merchant decisions outstanding
+See [verification](FORK-VERIFICATION.md) for the actual test counts and target versions. An independent read-only source review found no actionable defect in the reviewed normal Paystack/shared-order paths; it did not independently execute tests or certify provider behavior.
 
-- VAT registration and whether catalogue prices include VAT; applicable tax treatment.
-- Delivery destinations, courier/rates, free-shipping thresholds, collection and lead times.
-- Whether stock means finished goods, made-to-order capacity or untracked availability.
-- Personalisation requirements, paid extras and cancellation/refund/return rules.
-- Discount policy (including whether discounts are intentionally disabled initially).
-- Fulfilment workflow, notification requirements and approval to activate real email.
-- Production hostname/hosting topology, retention requirements and migration scope.
+Before calling a deployment production-ready:
 
-These decisions do not prevent implementing the underlying machinery. They do prevent inventing business rules or signing off the store for real customers.
+- [ ] Run actual Paystack sandbox-account hosted checkout, exact deployed webhook ingress, partial/full/dashboard refunds, interrupted requests and recovery with synthetic customers.
+- [ ] Validate account currencies, provider response/event shapes, credential rotation and operator recovery against that account; do not substitute fixture success for this evidence.
+- [ ] Obtain clean release-candidate CI and review the candidate on the intended supported Node/SQLite topology. Workers/PostgreSQL and broader Stripe functionality need separate evidence.
+- [ ] Validate HTTPS/proxy/cookie configuration, supervision, health monitoring/alerts, abuse controls, secret handling and receipt-capability privacy.
+- [ ] Demonstrate backups, restore/rollback and applicable retention/erasure procedures on disposable data.
+- [ ] If an existing store will be migrated, separately approve scope and rehearse non-destructively with price/options/URLs/media/stock comparisons and rollback evidence.
+- [ ] Approve actual store configuration and any real sender/delivery transport. Yoco/Resend activation and newsletters remain outside this work.
+- [ ] Obtain explicit deployment and live-payment authorization.
+
+No real payments, real email, deployment, DNS changes or existing-store migration were performed as part of this implementation verification.

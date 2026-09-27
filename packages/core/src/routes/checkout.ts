@@ -16,53 +16,65 @@
  */
 
 import type { PluginContext, RouteContext } from "emdash";
-import { randomId } from "../util/ids";
-import { recalculate, type PricingPolicy } from "../cart/calculate";
-import { getCart, save } from "../cart/store";
 import { CUSTOMISATION_FIELD_SLUG, validateCustomisation } from "../cart/customisation";
-import { createLock, newLock, sumActiveLocksForProduct } from "../cart/lock";
+import { createLock, deleteLock, newLock } from "../cart/lock";
+import { CouponQuotaConflict, reserveCouponClaims } from "../coupons/reservations";
+import { getCart, save } from "../cart/store";
+import { isObject, validEmail } from "../cart/validation";
+import { InventoryError, MAX_INVENTORY_QUANTITY, readInventoryAvailability } from "../inventory";
 import { money, zero } from "../money";
+import { PaymentProviderError, getHostedCheckoutProvider } from "../payment-provider";
+import { startCheckout } from "../payment-provider/paystack-test";
+import { normalizeProductFields } from "../products/normalize";
 import { resolvePrice } from "../products/pricing";
 import { getVariant } from "../products/variants";
-import { createPaymentIntent } from "../stripe/payment-intents";
+import { type CheckoutMode, DEFAULT_CHECKOUT_MODE } from "../settings/schema";
+import { priceCheckout, pricePaystackCheckout } from "../shipping/checkout";
 import {
-	createCheckoutSession,
 	type CheckoutLineItem,
 	type CheckoutShippingOption,
+	createCheckoutSession,
 } from "../stripe/checkout-sessions";
 import type { StripeClientOptions } from "../stripe/client";
+import { createPaymentIntent } from "../stripe/payment-intents";
 import type { CartLineItem, CartState, StockLockEntry } from "../types";
-import { normalizeProductFields } from "../products/normalize";
+import { randomId } from "../util/ids";
+import { getPublicSiteUrl } from "../util/site-url";
 import { computeSplit, connectEnabled } from "../vendors/split";
 import { resolveSessionId } from "./cart";
-import { DEFAULT_CHECKOUT_MODE, type CheckoutMode } from "../settings/schema";
-import { getPublicSiteUrl } from "../util/site-url";
-import { getHostedCheckoutProvider, PaymentProviderError } from "../payment-provider";
-import { startCheckout } from "../payment-provider/paystack-test";
-import { priceTestShippingAndTax } from "../shipping/checkout";
-import { isObject, validEmail } from "../cart/validation";
-import { InventoryError, MAX_INVENTORY_QUANTITY } from "../inventory";
 
 const DRAFT_PREFIX = "draft:";
 const DRAFT_TTL_MS = 15 * 60 * 1000;
 const LOCK_TTL_MS = 15 * 60 * 1000;
 
-async function readPricingPolicy(ctx: PluginContext): Promise<PricingPolicy> {
-	const mode = (await ctx.kv.get<string>("settings:taxMode")) ?? "flat";
-	const pct = (await ctx.kv.get<number>("settings:flatTaxRatePercent")) ?? 0;
-	const onShipping = (await ctx.kv.get<boolean>("settings:taxAppliesToShipping")) ?? false;
-	const policy: PricingPolicy = {
-		taxMode: mode === "table" ? "table" : mode === "stripe_tax" ? "stripe_tax" : "flat",
-		taxAppliesToShipping: onShipping,
-	};
-	if (policy.taxMode === "flat") policy.flatTaxPercent = pct;
-	return policy;
-}
-
 async function loadStripeClient(ctx: PluginContext): Promise<StripeClientOptions | null> {
 	const secret = await ctx.kv.get<string>("settings:stripeSecretKey");
 	if (!secret) return null;
 	return { secretKey: secret };
+}
+
+async function prepareStripeCoupons(
+	ctx: PluginContext,
+	id: string,
+	cart: CartState,
+	client: StripeClientOptions,
+): Promise<Response | null> {
+	try {
+		await reserveCouponClaims(
+			ctx,
+			id,
+			cart,
+			/^(sk|rk)_live_/.test(client.secretKey) ? "live" : "test",
+		);
+		return null;
+	} catch (error) {
+		if (!(error instanceof CouponQuotaConflict)) throw error;
+		await deleteLock(ctx, id);
+		await ctx.kv.delete(draftKey(id));
+		return new Response(JSON.stringify({ error: error.message, code: "coupon_quota" }), {
+			status: 409,
+		});
+	}
 }
 
 interface RepriceError {
@@ -77,16 +89,56 @@ interface RepriceResult {
 	stockEntries: StockLockEntry[];
 }
 
+/** Pure hosted-price projection; useful for regression-testing Stripe payloads. */
+export function buildHostedCheckoutLineItems(
+	cart: CartState,
+	stripeTaxEnabled: boolean,
+): CheckoutLineItem[] {
+	const lineItems: CheckoutLineItem[] = cart.items.map((line) => {
+		const gross = line.lineSubtotal.amount;
+		const discount = line.discountAmount?.amount ?? 0;
+		const foldDiscountIntoGroup = cart.discountTotal.amount > 0;
+		return {
+			amount: foldDiscountIntoGroup ? Math.max(0, gross - discount) : line.unitPrice.amount,
+			currency: line.unitPrice.currency.toLowerCase(),
+			name: line.title,
+			quantity: foldDiscountIntoGroup ? 1 : line.quantity,
+			metadata: {
+				productId: line.productId,
+				...(line.variantId ? { variantId: line.variantId } : {}),
+			},
+			...(line.subscriptionConfig
+				? {
+						recurring: {
+							interval: line.subscriptionConfig.interval,
+							intervalCount: line.subscriptionConfig.intervalCount,
+						},
+					}
+				: {}),
+			...(stripeTaxEnabled ? { taxBehavior: "exclusive" as const } : {}),
+		};
+	});
+	if (!stripeTaxEnabled && cart.taxTotal.amount > 0) {
+		lineItems.push({
+			amount: cart.taxTotal.amount,
+			currency: cart.currency.toLowerCase(),
+			name: "Tax",
+			quantity: 1,
+		});
+	}
+	return lineItems;
+}
+
 async function repriceAndCheckStock(
 	ctx: PluginContext,
 	cart: CartState,
-	reservationOwnsStockCheck = false,
+	_reservationOwnsStockCheck = false,
 ): Promise<RepriceResult> {
 	const errors: RepriceError[] = [];
 	const out: CartLineItem[] = [];
 	const stockEntries: StockLockEntry[] = [];
 
-	if (reservationOwnsStockCheck && cart.items.length > 100) {
+	if (cart.items.length > 100) {
 		return {
 			items: [],
 			errors: [{ lineId: "*", productId: "*", reason: "At most 100 checkout lines supported" }],
@@ -140,17 +192,6 @@ async function repriceAndCheckStock(
 			continue;
 		}
 		const fields = normalizeProductFields(record.data as Record<string, unknown>);
-		if (
-			reservationOwnsStockCheck &&
-			(!["simple", "variable"].includes(fields.type) || fields.taxClass !== "standard")
-		) {
-			errors.push({
-				lineId: line.lineId,
-				productId: line.productId,
-				reason: "Unsupported product type or tax class",
-			});
-			continue;
-		}
 		const variant = line.variantId ? await getVariant(ctx, line.variantId) : null;
 		if (line.variantId && (!variant || variant.productId !== line.productId || !variant.isActive)) {
 			errors.push({ lineId: line.lineId, productId: line.productId, reason: "invalid variant" });
@@ -180,23 +221,18 @@ async function repriceAndCheckStock(
 		const tracked =
 			(variant && variant.stockQuantity !== null) ||
 			(fields.manageStock && fields.stockQuantity !== null);
-		if (reservationOwnsStockCheck && !tracked) {
-			errors.push({
-				lineId: line.lineId,
+		// Hosted Paystack uses the CAS reservation below as its final stock
+		// authority. A replay must not reject its own already-held unit before
+		// startCheckout can reuse the stable attempt. Other sessions still race
+		// through reserveInventory and only one can claim finite stock.
+		if (tracked && !_reservationOwnsStockCheck) {
+			const availability = await readInventoryAvailability(ctx, {
 				productId: line.productId,
-				reason: "Finite managed stock required for test checkout",
+				...(line.variantId ? { variantId: line.variantId } : {}),
+				quantity: line.quantity,
 			});
-			continue;
-		}
-		if (tracked && !reservationOwnsStockCheck) {
-			const onHand = variant?.stockQuantity ?? fields.stockQuantity ?? 0;
-			const locked = await sumActiveLocksForProduct(
-				ctx,
-				line.productId,
-				line.variantId ?? undefined,
-			);
-			const available = onHand - locked;
-			if (requested.get(stockKey(line))! > available && fields.backorders === "no") {
+			const available = availability.effectiveStock ?? Number.MAX_SAFE_INTEGER;
+			if ((requested.get(stockKey(line)) ?? 0) > available && fields.backorders === "no") {
 				errors.push({
 					lineId: line.lineId,
 					productId: line.productId,
@@ -217,16 +253,21 @@ async function repriceAndCheckStock(
 			lineSubtotal: money(priced.unit.currency, priced.unit.amount * line.quantity),
 			title: fields.title,
 			isDigital: fields.isVirtual || fields.isDownloadable,
+			taxClass: fields.taxClass,
+			shippingClassSlug: fields.shippingClassSlug,
+			// Shipping is priced below from this revalidated snapshot; never
+			// retain the cart-add weight after CMS or variant changes.
+			weightGrams: variant?.weightGrams ?? fields.weightGrams,
 		};
 		out.push(repriced);
 
-		if (tracked) {
-			stockEntries.push({
-				productId: line.productId,
-				...(line.variantId ? { variantId: line.variantId } : {}),
-				quantity: line.quantity,
-			});
-		}
+		// Reserve every line, including untracked and backorderable products.
+		// The inventory projection decides whether a line consumes finite stock.
+		stockEntries.push({
+			productId: line.productId,
+			...(line.variantId ? { variantId: line.variantId } : {}),
+			quantity: line.quantity,
+		});
 	}
 
 	return { items: out, errors, stockEntries };
@@ -251,7 +292,7 @@ export const checkoutRoutes = {
 				});
 			}
 
-			let selectedProvider;
+			let selectedProvider: Awaited<ReturnType<typeof getHostedCheckoutProvider>>;
 			try {
 				selectedProvider = await getHostedCheckoutProvider(ctx);
 			} catch (err) {
@@ -284,7 +325,19 @@ export const checkoutRoutes = {
 			};
 
 			// Server-side re-price + stock check.
-			const { items, errors, stockEntries } = await repriceAndCheckStock(ctx, withContact);
+			let repriced: RepriceResult;
+			try {
+				repriced = await repriceAndCheckStock(ctx, withContact);
+			} catch (err) {
+				if (err instanceof InventoryError) {
+					return new Response(JSON.stringify({ error: err.message, code: err.code }), {
+						status: err.code === "conditional_kv_required" ? 503 : 409,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw err;
+			}
+			const { items, errors, stockEntries } = repriced;
 			if (errors.length > 0) {
 				return new Response(JSON.stringify({ error: "Cart validation failed", errors }), {
 					status: 409,
@@ -304,8 +357,7 @@ export const checkoutRoutes = {
 				);
 			}
 
-			const policy = await readPricingPolicy(ctx);
-			const recalculated = recalculate({ ...withContact, items }, policy);
+			const recalculated = await priceCheckout(ctx, { ...withContact, items });
 			if (recalculated.total.amount <= 0) {
 				return new Response(JSON.stringify({ error: "Order total must be positive" }), {
 					status: 400,
@@ -320,13 +372,17 @@ export const checkoutRoutes = {
 			if (stockEntries.length > 0) {
 				await createLock(
 					ctx,
-					newLock(orderDraftId, sessionId, stockEntries, { ttlMs: LOCK_TTL_MS }),
+					newLock(orderDraftId, sessionId, stockEntries, {
+						ttlMs: LOCK_TTL_MS,
+						mode: /^(sk|rk)_live_/.test(client.secretKey) ? "live" : "test",
+					}),
 				);
 			}
 
-			// Snapshot for webhook replay.
+			// Snapshot for webhook replay, including its immutable credential environment.
 			await ctx.kv.set(`${DRAFT_PREFIX}${orderDraftId}`, {
 				cart: recalculated,
+				mode: /^(sk|rk)_live_/.test(client.secretKey) ? "live" : "test",
 				ttlMs: DRAFT_TTL_MS,
 				createdAt: new Date().toISOString(),
 			});
@@ -372,6 +428,8 @@ export const checkoutRoutes = {
 				}
 			}
 
+			const couponError = await prepareStripeCoupons(ctx, orderDraftId, recalculated, client);
+			if (couponError) return couponError;
 			const pi = await createPaymentIntent(
 				ctx,
 				{
@@ -456,7 +514,7 @@ export const checkoutRoutes = {
 				});
 			}
 
-			let experimentalProviderForRoute;
+			let experimentalProviderForRoute: Awaited<ReturnType<typeof getHostedCheckoutProvider>>;
 			try {
 				experimentalProviderForRoute = await getHostedCheckoutProvider(ctx);
 			} catch (err) {
@@ -518,11 +576,19 @@ export const checkoutRoutes = {
 				...(input.notes ? { notes: input.notes } : {}),
 			};
 
-			const { items, errors, stockEntries } = await repriceAndCheckStock(
-				ctx,
-				withContact,
-				!!experimentalProviderForRoute,
-			);
+			let repriced: RepriceResult;
+			try {
+				repriced = await repriceAndCheckStock(ctx, withContact, !!experimentalProviderForRoute);
+			} catch (err) {
+				if (err instanceof InventoryError) {
+					return new Response(JSON.stringify({ error: err.message, code: err.code }), {
+						status: err.code === "conditional_kv_required" ? 503 : 409,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw err;
+			}
+			const { items, errors, stockEntries } = repriced;
 			if (errors.length > 0) {
 				return new Response(JSON.stringify({ error: "Cart validation failed", errors }), {
 					status: 409,
@@ -534,19 +600,27 @@ export const checkoutRoutes = {
 				try {
 					if (await connectEnabled(ctx))
 						throw new PaymentProviderError("Vendor splits unsupported", { status: 501 });
-					const priced = await priceTestShippingAndTax(ctx, { ...withContact, items });
+					const priced = await pricePaystackCheckout(ctx, { ...withContact, items });
 					const checkout = await startCheckout(
 						ctx,
-						(await ctx.kv.get<string>("settings:paystackSecretKey"))!,
+						experimentalProviderForRoute.secretKey,
 						priced,
 						stockEntries,
 						getPublicSiteUrl(ctx),
+						{
+							mode: experimentalProviderForRoute.mode,
+							provider: experimentalProviderForRoute.id,
+						},
 					);
 					return new Response(JSON.stringify(checkout), {
 						status: 200,
 						headers: { "Content-Type": "application/json" },
 					});
 				} catch (err) {
+					if (err instanceof CouponQuotaConflict)
+						return new Response(JSON.stringify({ error: err.message, code: "coupon_quota" }), {
+							status: 409,
+						});
 					if (err instanceof PaymentProviderError || err instanceof InventoryError)
 						return new Response(
 							JSON.stringify({
@@ -564,8 +638,10 @@ export const checkoutRoutes = {
 					throw err;
 				}
 			}
-			const policy = await readPricingPolicy(ctx);
-			const recalculated = recalculate({ ...withContact, items }, policy);
+			const client = stripeClient;
+			if (!client)
+				return new Response(JSON.stringify({ error: "Stripe not configured" }), { status: 500 });
+			const recalculated = await priceCheckout(ctx, { ...withContact, items });
 			if (recalculated.total.amount <= 0)
 				return new Response(JSON.stringify({ error: "Order total must be positive" }), {
 					status: 400,
@@ -577,12 +653,16 @@ export const checkoutRoutes = {
 			if (stockEntries.length > 0) {
 				await createLock(
 					ctx,
-					newLock(orderDraftId, sessionId, stockEntries, { ttlMs: LOCK_TTL_MS }),
+					newLock(orderDraftId, sessionId, stockEntries, {
+						ttlMs: LOCK_TTL_MS,
+						mode: /^(sk|rk)_live_/.test(client.secretKey) ? "live" : "test",
+					}),
 				);
 			}
 
 			await ctx.kv.set(`${DRAFT_PREFIX}${orderDraftId}`, {
 				cart: recalculated,
+				mode: /^(sk|rk)_live_/.test(client.secretKey) ? "live" : "test",
 				ttlMs: DRAFT_TTL_MS,
 				createdAt: new Date().toISOString(),
 			});
@@ -611,7 +691,7 @@ export const checkoutRoutes = {
 			// knows whether the price is pre- or post-tax. We default to
 			// "exclusive" (add tax on top), which is the common online
 			// store shape.
-			const stripeTaxEnabled = policy.taxMode === "stripe_tax";
+			const stripeTaxEnabled = (await ctx.kv.get<string>("settings:taxMode")) === "stripe_tax";
 
 			// Build Checkout Session line items from the re-priced cart. We
 			// deliberately do NOT push tax/discount/shipping as line items
@@ -620,25 +700,10 @@ export const checkoutRoutes = {
 			// merchant's coupon engine already applied are baked into the
 			// line `unit_amount` so the Stripe total matches `cart.total`
 			// exactly.
-			const lineItems: CheckoutLineItem[] = recalculated.items.map((line) => ({
-				amount: line.unitPrice.amount,
-				currency: line.unitPrice.currency.toLowerCase(),
-				name: line.title,
-				quantity: line.quantity,
-				metadata: {
-					productId: line.productId,
-					...(line.variantId ? { variantId: line.variantId } : {}),
-				},
-				...(line.subscriptionConfig
-					? {
-							recurring: {
-								interval: line.subscriptionConfig.interval,
-								intervalCount: line.subscriptionConfig.intervalCount,
-							},
-						}
-					: {}),
-				...(stripeTaxEnabled ? { taxBehavior: "exclusive" as const } : {}),
-			}));
+			// Checkout cannot represent a negative native coupon line. The snapshot
+			// carries bounded largest-remainder line allocations, so its grouped
+			// amounts are exact and non-negative.
+			const lineItems = buildHostedCheckoutLineItems(recalculated, stripeTaxEnabled);
 
 			const shippingOptions: CheckoutShippingOption[] = recalculated.shippingMethod
 				? [
@@ -738,14 +803,10 @@ export const checkoutRoutes = {
 					}
 				: undefined;
 
-			const client = stripeClient;
-			if (!client) {
-				return new Response(
-					JSON.stringify({ error: "Stripe not configured (settings:stripeSecretKey)" }),
-					{ status: 500, headers: { "Content-Type": "application/json" } },
-				);
+			if (!isSubscriptionCart) {
+				const couponError = await prepareStripeCoupons(ctx, orderDraftId, recalculated, client);
+				if (couponError) return couponError;
 			}
-
 			const session = await createCheckoutSession(
 				ctx,
 				{
@@ -830,7 +891,7 @@ export const checkoutRoutes = {
 			const ctx = (_ctx ?? (_routeCtx as unknown as PluginContext)) as PluginContext;
 			const mode =
 				(await ctx.kv.get<CheckoutMode>("settings:checkoutMode")) ?? DEFAULT_CHECKOUT_MODE;
-			let provider;
+			let provider: Awaited<ReturnType<typeof getHostedCheckoutProvider>>;
 			try {
 				provider = await getHostedCheckoutProvider(ctx);
 			} catch (err) {
@@ -848,6 +909,8 @@ export const checkoutRoutes = {
 
 export type CheckoutDraftSnapshot = {
 	cart: CartState;
+	mode?: "test" | "live";
+	failed?: boolean;
 	ttlMs: number;
 	createdAt: string;
 };

@@ -77,6 +77,11 @@ export const SETTINGS_KEYS = [
 	"stripeWebhookSecret",
 	"checkoutMode",
 	"paymentProvider",
+	"receiptEmailEnabled",
+	"paystackMode",
+	"paystackTestSecretKey",
+	"paystackLiveSecretKey",
+	// Compatibility fallback for installations created by the test-only integration.
 	"paystackSecretKey",
 ] as const;
 
@@ -85,6 +90,8 @@ export type SettingsKey = (typeof SETTINGS_KEYS)[number];
 export const SECRET_SETTINGS_KEYS: ReadonlySet<string> = new Set<string>([
 	"stripeSecretKey",
 	"stripeWebhookSecret",
+	"paystackTestSecretKey",
+	"paystackLiveSecretKey",
 	"paystackSecretKey",
 ]);
 
@@ -107,6 +114,10 @@ export type TaxMode = (typeof TAX_MODES)[number];
 export const CHECKOUT_MODES = ["hosted", "embedded"] as const;
 export type CheckoutMode = (typeof CHECKOUT_MODES)[number];
 export const DEFAULT_CHECKOUT_MODE: CheckoutMode = "hosted";
+
+export const PAYSTACK_MODES = ["test", "live"] as const;
+export type PaystackMode = (typeof PAYSTACK_MODES)[number];
+export const DEFAULT_PAYSTACK_MODE: PaystackMode = "test";
 
 /**
  * Validate a single settings key/value pair. Callers that need cross-key
@@ -145,6 +156,7 @@ export function validateSettingsKey(key: string, value: unknown): Result<unknown
 		case "reviewsRequireApproval":
 		case "reviewsRequirePurchase":
 		case "connectEnabled":
+		case "receiptEmailEnabled":
 			return asBool(value, key);
 		case "downloadTokenTtlHours":
 			return asInt(value, key, 1, 24 * 365);
@@ -163,13 +175,22 @@ export function validateSettingsKey(key: string, value: unknown): Result<unknown
 		case "stripeWebhookSecret":
 			return asStringWithPrefix(value, key, ["whsec_"]);
 		case "paymentProvider":
-			return value === "stripe" || value === "paystack-test"
+			return value === "stripe" || value === "paystack" || value === "paystack-test"
 				? ok(value)
-				: bad("Only stripe and paystack-test are supported");
+				: bad("paymentProvider must be one of: stripe, paystack, paystack-test");
+		case "paystackMode":
+			return typeof value === "string" && PAYSTACK_MODES.includes(value as PaystackMode)
+				? ok(value)
+				: bad(`paystackMode must be one of: ${PAYSTACK_MODES.join(", ")}`);
+		case "paystackTestSecretKey":
 		case "paystackSecretKey":
 			return typeof value === "string" && /^sk_test_[A-Za-z0-9]+$/.test(value)
 				? ok(value)
-				: bad("Paystack test secret required; live keys rejected");
+				: bad(`${key} must be a Paystack test secret starting with sk_test_`);
+		case "paystackLiveSecretKey":
+			return typeof value === "string" && /^sk_live_[A-Za-z0-9]+$/.test(value)
+				? ok(value)
+				: bad("paystackLiveSecretKey must be a Paystack live secret starting with sk_live_");
 		case "checkoutMode": {
 			if (typeof value !== "string" || !CHECKOUT_MODES.includes(value as CheckoutMode)) {
 				return bad(`checkoutMode must be one of: ${CHECKOUT_MODES.join(", ")}`);

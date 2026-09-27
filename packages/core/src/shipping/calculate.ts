@@ -24,10 +24,7 @@ export function matchesZone(address: Address, zone: ShippingZone): boolean {
 	return false;
 }
 
-export function pickZone(
-	address: Address,
-	zones: ShippingZone[],
-): ShippingZone | null {
+export function pickZone(address: Address, zones: ShippingZone[]): ShippingZone | null {
 	const sorted = [...zones].sort((a, b) => a.order - b.order);
 	for (const zone of sorted) {
 		if (matchesZone(address, zone)) return zone;
@@ -57,6 +54,15 @@ export interface CalculateRatesInput {
 	couponsGiveFreeShipping?: boolean;
 }
 
+function validAmount(value: Money | undefined, currency: string): value is Money {
+	return (
+		!!value &&
+		value.currency === currency &&
+		Number.isSafeInteger(value.amount) &&
+		value.amount >= 0
+	);
+}
+
 export function calculateRates(input: CalculateRatesInput): ShippingRateOption[] {
 	const subtotal = cartSubtotal(input.items, input.currency);
 	const weightGrams = cartWeightGrams(input.items);
@@ -65,32 +71,44 @@ export function calculateRates(input: CalculateRatesInput): ShippingRateOption[]
 	for (const method of input.methods) {
 		if (!method.enabled) continue;
 		const cfg = method.config;
+		// A mixed-class override has no documented sum/max rule. Do not expose
+		// the base rate and silently undercharge; admin must remove/configure it.
+		if (cfg.type === "flat_rate" && Object.keys(cfg.shippingClassRates ?? {}).length > 0) continue;
+		if (method.type !== cfg.type) continue;
+
+		// Validate configuration before a coupon can make its amount zero.
+		if (
+			(cfg.type === "flat_rate" && !validAmount(cfg.amount, input.currency)) ||
+			(cfg.type === "local_pickup" &&
+				cfg.amount !== undefined &&
+				!validAmount(cfg.amount, input.currency)) ||
+			(cfg.type === "free_shipping" &&
+				cfg.minimumAmount !== undefined &&
+				!validAmount(cfg.minimumAmount, input.currency)) ||
+			(cfg.type === "weight_based" &&
+				(!validAmount(cfg.base, input.currency) ||
+					cfg.currency !== input.currency ||
+					!Number.isFinite(cfg.perGram) ||
+					cfg.perGram < 0))
+		)
+			continue;
 
 		if (input.couponsGiveFreeShipping) {
-			options.push({
-				methodId: method.id,
-				label: method.title,
-				amount: zero(input.currency),
-			});
+			options.push({ methodId: method.id, label: method.title, amount: zero(input.currency) });
 			continue;
 		}
 
 		if (cfg.type === "flat_rate") {
-			options.push({
-				methodId: method.id,
-				label: method.title,
-				amount: cfg.amount,
-			});
+			options.push({ methodId: method.id, label: method.title, amount: cfg.amount });
 		} else if (cfg.type === "free_shipping") {
 			const min = cfg.minimumAmount;
-			const qualifies = !min || subtotal.amount >= min.amount;
-			if (qualifies) {
-				options.push({
-					methodId: method.id,
-					label: method.title,
-					amount: zero(input.currency),
-				});
-			}
+			// A threshold in another currency is not comparable and must not
+			// accidentally qualify a free rate.
+			const qualifies =
+				!cfg.requiresCoupon &&
+				(!min || (validAmount(min, input.currency) && subtotal.amount >= min.amount));
+			if (qualifies)
+				options.push({ methodId: method.id, label: method.title, amount: zero(input.currency) });
 		} else if (cfg.type === "local_pickup") {
 			options.push({
 				methodId: method.id,
@@ -98,13 +116,8 @@ export function calculateRates(input: CalculateRatesInput): ShippingRateOption[]
 				amount: cfg.amount ?? zero(input.currency),
 			});
 		} else if (cfg.type === "weight_based") {
-			if (cfg.currency !== input.currency) continue;
 			const variable = money(cfg.currency, Math.round(cfg.perGram * weightGrams));
-			options.push({
-				methodId: method.id,
-				label: method.title,
-				amount: add(cfg.base, variable),
-			});
+			options.push({ methodId: method.id, label: method.title, amount: add(cfg.base, variable) });
 		}
 	}
 

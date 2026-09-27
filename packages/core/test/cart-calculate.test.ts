@@ -40,9 +40,7 @@ describe("cart recalculate", () => {
 	});
 
 	it("sums line subtotals into cart subtotal", () => {
-		const result = recalculate(
-			baseCart([line("a", 2, 1000), line("b", 1, 500)]),
-		);
+		const result = recalculate(baseCart([line("a", 2, 1000), line("b", 1, 500)]));
 		expect(result.subtotal.amount).toBe(2500);
 		expect(result.total.amount).toBe(2500);
 	});
@@ -50,9 +48,7 @@ describe("cart recalculate", () => {
 	it("applies flat percentage tax to post-discount subtotal", () => {
 		const cart = {
 			...baseCart([line("a", 1, 10_000)]),
-			coupons: [
-				{ code: "SAVE", discountAmount: money("USD", 1_000), freeShipping: false },
-			],
+			coupons: [{ code: "SAVE", discountAmount: money("USD", 1_000), freeShipping: false }],
 		};
 		const result = recalculate(cart, { taxMode: "flat", flatTaxPercent: 10 });
 		expect(result.discountTotal.amount).toBe(1_000);
@@ -83,15 +79,62 @@ describe("cart recalculate", () => {
 		expect(withShipTax.taxTotal.amount).toBe(1_050);
 	});
 
+	it("uses table rates that explicitly apply to shipping", () => {
+		const cart = {
+			...baseCart([line("a", 1, 10_000)]),
+			shippingMethod: { id: "flat", label: "Flat", amount: money("USD", 500) },
+		};
+		const result = recalculate(cart, {
+			taxMode: "table",
+			taxResolver: ({ base }) => [{ label: "Goods", amount: money(base.currency, 700), rate: 7 }],
+			shippingTaxResolver: ({ base }) => [
+				{ label: "Shipping", amount: money(base.currency, 25), rate: 5 },
+			],
+		});
+		expect(result.taxTotal.amount).toBe(725);
+		expect(result.total.amount).toBe(11_225);
+	});
+
 	it("clamps negative totals to zero (over-discounted cart)", () => {
 		const cart = {
 			...baseCart([line("a", 1, 500)]),
-			coupons: [
-				{ code: "BIG", discountAmount: money("USD", 1_000), freeShipping: false },
-			],
+			coupons: [{ code: "BIG", discountAmount: money("USD", 1_000), freeShipping: false }],
 		};
 		const result = recalculate(cart);
 		expect(result.total.amount).toBe(0);
+	});
+
+	it("keeps a product coupon on its eligible tax class", () => {
+		const zeroRated = { ...line("zero", 1, 1_000), taxClass: "zero" };
+		const standard = { ...line("standard", 1, 1_000), taxClass: "standard" };
+		const result = recalculate(
+			{
+				...baseCart([zeroRated, standard]),
+				coupons: [
+					{
+						code: "ZEROONLY",
+						discountAmount: money("USD", 1_000),
+						freeShipping: false,
+						lineDiscounts: {
+							"l-zero": money("USD", 1_000),
+							"l-standard": money("USD", 0),
+						},
+					},
+				],
+			},
+			{
+				taxMode: "table",
+				taxResolver: ({ base, taxClass }) => [
+					{
+						label: taxClass ?? "standard",
+						amount: money(base.currency, taxClass === "standard" ? base.amount / 10 : 0),
+					},
+				],
+			},
+		);
+		expect(result.taxTotal.amount).toBe(100);
+		expect(result.items[0]?.taxAmount?.amount).toBe(0);
+		expect(result.items[1]?.taxAmount?.amount).toBe(100);
 	});
 
 	it("passes tax lines through from resolver (table mode)", () => {

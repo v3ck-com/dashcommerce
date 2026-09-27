@@ -18,11 +18,19 @@ type StorageConfig = NonNullable<PluginDescriptor["storage"]>;
 
 export const DASHCOMMERCE_STORAGE: StorageConfig = {
 	orders: {
-		indexes: ["customerId", "status", "paymentStatus", "createdAt", "paidAt"],
+		indexes: [
+			"customerId",
+			"status",
+			"paymentStatus",
+			"createdAt",
+			"paidAt",
+			"paymentMode",
+			"paymentProvider",
+		],
 		uniqueIndexes: ["stripePaymentIntentId", "paymentReference", "orderNumber"],
 	},
 	payments: {
-		indexes: ["provider", "orderDraftId", "status"],
+		indexes: ["provider", "mode", "orderDraftId", "status"],
 		uniqueIndexes: ["paymentKey"],
 	},
 	payment_attempts: {
@@ -34,7 +42,10 @@ export const DASHCOMMERCE_STORAGE: StorageConfig = {
 	},
 	refunds: {
 		indexes: ["orderId", "createdAt"],
-		uniqueIndexes: ["stripeRefundId"],
+		uniqueIndexes: ["stripeRefundId", "requestId", "providerRefundKey"],
+	},
+	commerce_outbox: {
+		indexes: ["orderId", "status", "createdAt"],
 	},
 	customers: {
 		indexes: ["userId", "createdAt"],

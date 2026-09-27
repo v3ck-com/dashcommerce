@@ -152,19 +152,30 @@ export interface CartLineItem {
 	vendorId?: string;
 	subscriptionConfig?: SubscriptionConfig;
 	shippingClassSlug?: string | null;
+	/** Server-authoritative product tax class, stamped during cart/reprice. */
+	taxClass?: string;
 	weightGrams?: number | null;
+	/** Derived authoritative allocation across all applied coupons. */
+	discountAmount?: Money;
+	/** Derived authoritative allocation of the cart tax to this goods line. */
+	taxAmount?: Money;
 }
 
 export interface AppliedCoupon {
 	code: string;
+	/** Stable merchant record identity, retained if a code is renamed after checkout. */
+	couponId?: string;
 	discountAmount: Money;
 	freeShipping: boolean;
+	/** Authoritative discount allocation keyed by stable cart line ID. */
+	lineDiscounts?: Record<string, Money>;
 }
 
 export interface TaxLine {
 	label: string;
 	amount: Money;
-	rate: number; // percentage
+	/** Percentage when known; provider-calculated aggregate tax may omit its rate. */
+	rate?: number;
 }
 
 export interface CartState {
@@ -238,7 +249,20 @@ export interface Order {
 	vendorSplits?: VendorSplit[];
 	subscriptionIds?: string[];
 	stripePaymentIntentId?: string; // Stripe orders only
-	paymentProvider?: "stripe" | "paystack-test";
+	paymentProvider?: "stripe" | "paystack" | "paystack-test";
+	paymentMode?: "test" | "live";
+	/** Atomic ceiling reservations and applied confirmations, keyed by durable refund request. */
+	refundReservations?: Record<
+		string,
+		{
+			amount: number;
+			status: "pending" | "succeeded" | "failed";
+			providerRefundId?: string;
+			/** Explicit restock units by order-item ID, held until confirmed failure.
+			 * Empty means no restock; absent means a legacy journal requiring hydration. */
+			restockQuantities?: Record<string, number>;
+		}
+	>;
 	paymentReference?: string; // unique provider-qualified transaction reference
 	stripeCustomerId?: string;
 	stripeChargeId?: string;
@@ -258,10 +282,13 @@ export interface Order {
 export interface PaymentRecord {
 	id: string;
 	paymentKey: string;
-	provider: "paystack-test";
+	provider: "stripe" | "paystack" | "paystack-test";
+	mode?: "test" | "live";
+	snapshotHash?: string;
+	orderNumber?: string;
 	orderDraftId: string;
 	amount: Money;
-	status: "verified_test" | "finalized_test";
+	status: "verified" | "finalized" | "verified_test" | "finalized_test";
 	inventoryStatus?: "consumed" | "not_required" | "manual_review";
 	inventoryReason?: string;
 	orderId: string;
@@ -294,13 +321,25 @@ export interface Refund {
 	amount: Money;
 	reason?: string;
 	status: "pending" | "succeeded" | "failed";
-	stripeRefundId: string; // unique
+	stripeRefundId?: string; // Stripe only, unique
+	paymentProvider?: "stripe" | "paystack";
+	paymentMode?: "test" | "live";
+	providerRefundId?: string;
+	providerRefundKey?: string;
+	requestId?: string;
+	/** Original merchant request token, for resolving a durable browser intent after reload. */
+	clientRequestId?: string;
+	requestHash?: string;
+	transportState?: "prepared" | "submitting" | "uncertain" | "confirmed";
+	restockRequested?: boolean;
 	lineItemRefunds?: Array<{
 		orderItemId: string;
 		quantity: number;
 		amount: Money;
 	}>;
 	restocked: boolean;
+	/** Written last after terminal refund accounting, stock and notification effects. */
+	effectsFinalized?: boolean;
 	createdAt: IsoDateTime;
 	createdByUserId?: string;
 }
@@ -322,6 +361,8 @@ export interface Customer {
 	ordersCount: number;
 	/** Total spent keyed by currency, in minor units. */
 	totalSpent: Record<CurrencyCode, number>;
+	/** CAS deduplication is in the same record as financial counters. Live orders only. */
+	accountedOrderIds?: Record<string, true>;
 	acceptsMarketing: boolean;
 	createdAt: IsoDateTime;
 	updatedAt: IsoDateTime;
@@ -348,6 +389,8 @@ export type DiscountType =
 export interface Coupon {
 	id: string;
 	code: string; // unique, case-insensitive on input
+	/** Server-maintained aliases for bounded legacy usage-history reconciliation. */
+	historicalCodes?: string[];
 	description?: string;
 	discountType: DiscountType;
 	discountValue: number; // percent (0-100) or minor units
@@ -380,6 +423,7 @@ export interface CouponUsage {
 	 */
 	dedupKey: string;
 	couponCode: string;
+	couponId?: string;
 	customerId?: string;
 	orderId: string;
 	discountAmount: Money;
@@ -643,6 +687,8 @@ export interface StockLockEntry {
 }
 
 export interface StockLock {
+	/** Captured at creation; historical records without a mode belong to test. */
+	mode?: "test" | "live";
 	orderDraftId: string;
 	sessionId: string;
 	stripePaymentIntentId?: string;

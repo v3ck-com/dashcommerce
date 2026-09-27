@@ -1,33 +1,34 @@
 # DashCommerce — v3ck-com fork
 
-A development fork of [emdashCommerce/dashcommerce](https://github.com/emdashCommerce/dashcommerce), adding **Paystack test checkout and personalised products** on **EmDash 0.41.0**.
+A development fork of [emdashCommerce/dashcommerce](https://github.com/emdashCommerce/dashcommerce), adding **Paystack as a normal payment gateway alongside Stripe**, personalised products, and recoverable shared commerce workflows on **EmDash 0.41.0**. MIT; upstream attribution and history are retained.
 
-**Test-mode software, not a production payment release.** No live Paystack payments, automatic fulfilment, real email, or real-order migration is enabled. This repository contains synthetic fixtures, not an existing shop or its customer data. MIT; upstream attribution and history are retained.
-
-Production readiness is the next implementation target. The current blockers and required acceptance evidence are tracked in [Production readiness](docs/PRODUCTION-READINESS.md); the existing test gates do not constitute production sign-off.
-
-## Supported development target
-
-- EmDash **exactly 0.41.0**; other versions fail closed.
-- Astro **7.3.5**, standalone Node, SQLite. Node 22.16+ and Bun 1.4.2.
-- Native EmDash `pluginResponse()` and bounded raw-byte webhook contracts. **No EmDash dependency patches.**
-- Trusted starter middleware owns cart cookies, method/origin checks and private caching. HTTPS uses a Secure `__Host-` cookie; HTTP is for loopback development.
-- Cloudflare Workers and PostgreSQL are **not certified** by this fork. Existing Stripe features remain legacy code, not newly certified live-payment functionality.
+**Test and live code paths are implemented; production activation is not approved or certified.** Verification uses disposable databases and intercepted synthetic provider traffic, including tests of live-mode code. No actual payment, real email, deployment or existing-store migration is performed. See [readiness and limitations](docs/PRODUCTION-READINESS.md), [operator guidance](docs/OPERATOR_CHECKLIST.md) and [verification evidence](docs/FORK-VERIFICATION.md).
 
 ## Implemented
 
-- Explicit `paystack-test` provider; unknown providers fail rather than falling back to Stripe. Only `sk_test_` credentials and ZAR are accepted.
-- Fixed-origin Paystack initialize/verify transport, bounded responses, timeouts, redirect refusal, SHA-512 webhook verification, and independently verified transaction identity/amount/currency/test domain/email.
-- Server-priced checkout with complete shipping/billing addresses; current stock, personalisation, supported flat/free shipping and flat tax are revalidated.
-- Durable checkout identity, one initialization claim, retry-safe references, recoverable order/item/payment writes, and concurrent callback/webhook handling using EmDash revision CAS.
-- CAS stock reservations and idempotent consumption. A late payment with unavailable inventory is held for manual review, never silently re-reserved.
-- Merchant-defined bounded text personalisation, separate cart lines for distinct options, and propagation to orders and receipts.
-- Browser checkout, authoritative return polling, pending/failure/review states, uncertainty recovery link, and conditional purchased-cart cleanup that preserves newer edits.
-- Durable **preview-only** receipt outbox. No Resend delivery or Yoco integration is activated; newsletters are outside this implementation.
+- Normal `paymentProvider=paystack`, explicit test/live selection and separately encrypted credentials. The legacy `paystack-test` alias remains test-only. Persisted transactions keep their original environment after settings change.
+- Hosted checkout, fixed-origin initialize/verify/refund transport, bounded responses and exact-byte authenticated webhooks. Provider reference, amount, currency, environment and customer are independently checked; redirects are not payment proof.
+- Shared authoritative pricing: current product/variant prices and weights, personalisation, shipping zones, flat/free/pickup/weight rates, flat or table tax with product tax classes, and existing coupon rules. Discounts are allocated deterministically across eligible lines and preserved on order items.
+- Live coupon quota claims before initialization; same-record CAS accounting for usage, customer limits and replay identity. Test transactions do not consume live coupon quotas. Lost capacity holds a paid order for review rather than silently granting fulfilment.
+- Shared Stripe/Paystack order finalization, deterministic order/item identities, recoverable effects and final markers committed last. Ordinary orders are not automatically held merely because Paystack was used.
+- Separate test/live inventory projections, atomic reservations/consumption, explicit partial restocking, and guarded CMS stock adoption through the private operations page.
+- Durable full/partial refunds, monetary and per-item restock reservations, pending/uncertain states, provider-ID reconciliation and independently verified Paystack dashboard refund synchronization. An ambiguous financial POST is never blindly repeated.
+- Native private payment operations, bounded periodic recovery, truthful receipts/refund states and purchased-cart cleanup that preserves newer cart edits.
+- Durable receipt/refund outbox. Actual delivery requires explicit configuration and native EmDash email; test messages remain suppressed. Uncertain email handoffs are not automatically resent.
+
+Paystack does **not** substitute for Stripe Elements, Stripe Tax, Connect/vendor splits or subscriptions. Those remain separate Stripe-specific capabilities. Yoco/Resend activation and newsletters are outside this implementation.
+
+## Supported development target
+
+- EmDash **exactly 0.41.0**; other versions fail closed. Native response/body/storage contracts, **no dependency patches**.
+- Astro **7.3.5**, standalone Node and SQLite; Node 22.16+ and Bun 1.4.2.
+- Trusted starter middleware owns cart cookies, method/origin checks and private caching. HTTPS uses a Secure `__Host-` cookie; HTTP is for loopback development.
+- Paystack currency allowlist: GHS, KES, NGN, USD and ZAR, subject to the merchant account's actual capabilities. Integrated financial fixtures exercise ZAR.
+- Workers/PostgreSQL and real provider behavior are not certified by this fork. Existing broader Stripe features do not inherit certification from the shared-order tests.
 
 ## Run the checks
 
-These checks create disposable databases and synthetic keys. Provider HTTP, DNS and the hosted payment page are intercepted locally; no Paystack/Stripe charge or email is sent.
+Provider HTTP/DNS and hosted payment pages are intercepted locally. No provider credentials are needed.
 
 ```sh
 bun install --frozen-lockfile
@@ -41,41 +42,42 @@ bun run test:browser
 bun audit --production
 ```
 
-CI runs the same gates on Node 22 and 24, with no payment credentials. Browser tests use the real cart, checkout, payment verification and order endpoints; only the external provider is simulated. Additional UI-state tests stub authority responses deliberately.
+CI runs the same gates on Node 22 and 24. Browser tests use real application cart, checkout, verification and order endpoints; only the external provider is simulated. Additional UI-state tests intentionally stub authority responses.
 
 ## Configure a fresh local store
 
-Use a **new, disposable database** first. The inherited seed/bootstrap commands can replace matching collection definitions: do not run them against an existing shop without a migration plan and backup.
+Use a **new disposable database** first. Seed/bootstrap may replace matching collection definitions; never run it against an existing shop without an audited migration and backup.
 
-1. Follow the [starter instructions](packages/starter/README.md) and complete EmDash owner setup.
-2. Set a persistent private `EMDASH_ENCRYPTION_KEY` using EmDash's supported configuration. Keep environment files and credentials out of Git.
-3. In DashCommerce settings, choose **Paystack — test mode only**, enter the test secret, choose **hosted** checkout, and configure ZAR as an enabled/default currency. Native EmDash secret settings encrypt the secret at rest; the admin API returns only secret presence/hints.
-4. Set ZAR product prices and finite managed stock. Configure supported delivery methods for the intended country. Fixture shipping/tax values are examples, not merchant-approved business rules.
-5. Configure the canonical site URL. Callbacks require HTTPS, except explicit loopback HTTP development. Public webhook ingress is a separate deployment decision.
+1. Follow the [starter instructions](packages/starter/README.md) and complete native EmDash owner setup.
+2. Configure a persistent private `EMDASH_ENCRYPTION_KEY` through supported EmDash configuration. Keep keys/environment files out of Git.
+3. In DashCommerce settings choose **Paystack**, **test** mode and **hosted** checkout; enter the test secret. Secret settings are encrypted at rest and admin responses expose only presence/hints. Live credentials and activation are separate, explicit decisions.
+4. Configure the existing product, variant, stock, shipping, tax and coupon settings normally. Fixture values are examples, not business-policy defaults imposed by this fork.
+5. Set the canonical site URL. Callbacks require HTTPS except explicit loopback development. Public webhook ingress requires its own deployment approval.
 
-Webhook: `POST /_emdash/api/plugins/dashcommerce/checkout/paystack-webhook`.
-Return verification: `GET /_emdash/api/plugins/dashcommerce/orders/by-draft?id=<private-draft-capability>`.
-Never treat query-string payment status or a browser redirect as proof of payment.
+Webhook: `POST /_emdash/api/plugins/dashcommerce/checkout/paystack` (legacy `/checkout/paystack-webhook` remains supported).
 
-### Personalisation schema
+Receipt: `GET /_emdash/api/plugins/dashcommerce/orders/by-draft?id=<private-draft-capability>`.
 
-A product's `customisation_definition` JSON can contain up to four text fields:
+Keep receipt capabilities out of analytics and referrer logs. Never infer payment from URL parameters.
+
+### Personalisation
+
+A product's `customisation_definition` JSON supports up to four bounded text fields:
 
 ```json
 {"fields":[{"key":"recipient_name","required":true,"maxLength":40}]}
 ```
 
-Keys are validated; text is trimmed, bounded (maximum 120 characters per field), escaped when displayed, and revalidated against the current product definition at checkout. Rich conditional options, uploads and paid extras are not implemented.
+Values are trimmed, bounded (maximum 120 characters per field), escaped, repriced/revalidated at checkout and retained on order items. Different options remain distinct cart lines. Conditional option builders, uploads and paid extras are not implemented.
 
-## Operational limits
+## Important boundaries
 
-- Test payments create TEST-labelled, on-hold orders. `paymentStatus: "paid"` means a **verified sandbox transaction** only when paired with `paymentProvider: "paystack-test"` and test metadata. It is not live money or permission to fulfil.
-- Preview outbox entries are private plugin KV records under `receipt-preview:` with `delivery: "disabled"`; no mail transport runs.
-- Ambiguous initialization is not automatically repeated. Keep its private draft reference and reconcile; a crash before the provider POST may need operator intervention.
-- Inventory is maintained in a single CAS projection, not simultaneously decremented in CMS fields. Out-of-band CMS stock changes require explicit `reconcileInventory` from `packages/core/src/inventory/index.ts`. A merchant reconciliation UI, retention policy and high-volume partitioning are not provided.
-- Legacy Stripe inventory/finalization must not be mixed with this projection without a separate compatibility/reconciliation plan. This fork does not claim production Stripe regression certification.
-- Coupons, subscriptions, Connect, non-standard tax classes, advanced shipping, untracked/backorder stock, live Paystack and Paystack refunds are rejected in the test checkout.
-- Production still needs independent security/operations review, merchant-approved shipping/tax/discount rules, reconciliation/refunds, backups, HTTPS, privacy/retention controls and fulfilment validation. Keep private order capabilities out of analytics and referrer logs.
-- Existing stores, infrastructure, DNS and deployments are not modified by these scripts. There is no automatic migration from WordPress, another commerce implementation, or earlier experimental payment records.
+- Test orders can exercise normal processing states, but remain clearly labelled simulations: no live stock, revenue/coupon accounting, digital grants or email delivery.
+- Nonempty per-shipping-class flat-rate overrides are not priced: their mixed-class aggregation semantics are undefined. Such methods are unavailable rather than silently falling back to their base rate.
+- Zero-total/free-order checkout is not implemented by the Paystack payment gateway.
+- Inventory projections, not simultaneous CMS decrements, govern operational stock. CMS stock changes require deliberate preview/adoption. Test and live adoption are separate.
+- Unknown refund POST outcomes require independently verified provider information; an absent provider ID is not permission to resend or release the financial reservation.
+- Pre-journal/unmarked legacy financial records and old inventory effects require explicit reconciliation. There is no automatic migration from another shop or earlier experiments. Legacy automatic refund restocking is rejected without a recorded inventory reservation.
+- Large legacy coupon histories fail closed when bounded hydration is insufficient. High-volume partitioning, retention/erasure, deployment monitoring and backup/restore procedures need deployment-specific validation.
 
-The fork is source-only: npm release and upstream synchronization workflows are removed, and the core package is marked private to prevent accidental publication under the upstream npm name. See [upstream](https://github.com/emdashCommerce/dashcommerce) for its original feature documentation; those broader claims are not a certification of this fork.
+The fork is source-only: npm release/upstream synchronization workflows are removed and the core package is private to prevent accidental publication under the upstream package name. Existing storefronts, services, DNS and customer data are not modified by these checks.

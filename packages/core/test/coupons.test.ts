@@ -58,46 +58,35 @@ describe("validateCoupon", () => {
 
 	it("rejects expired coupons", () => {
 		const cart = cartWithItems([line("a", 1, 10_000)]);
-		const result = validateCoupon(
-			baseCoupon({ endsAt: "2000-01-01T00:00:00Z" }),
-			{ cart },
-		);
+		const result = validateCoupon(baseCoupon({ endsAt: "2000-01-01T00:00:00Z" }), { cart });
 		expect(result.ok).toBe(false);
 	});
 
 	it("rejects below-minimum subtotal", () => {
 		const cart = cartWithItems([line("a", 1, 500)]);
-		const result = validateCoupon(
-			baseCoupon({ minAmount: money("USD", 1_000) }),
-			{ cart },
-		);
+		const result = validateCoupon(baseCoupon({ minAmount: money("USD", 1_000) }), { cart });
 		expect(result.ok).toBe(false);
 	});
 
 	it("rejects usage-limit-reached coupons", () => {
 		const cart = cartWithItems([line("a", 1, 10_000)]);
-		const result = validateCoupon(
-			baseCoupon({ usageLimit: 5, usageCount: 5 }),
-			{ cart },
-		);
+		const result = validateCoupon(baseCoupon({ usageLimit: 5, usageCount: 5 }), { cart });
 		expect(result.ok).toBe(false);
 	});
 
 	it("rejects per-customer usage limit", () => {
 		const cart = cartWithItems([line("a", 1, 10_000)]);
-		const result = validateCoupon(
-			baseCoupon({ usageLimitPerCustomer: 1 }),
-			{ cart, usageByCustomer: 1 },
-		);
+		const result = validateCoupon(baseCoupon({ usageLimitPerCustomer: 1 }), {
+			cart,
+			usageByCustomer: 1,
+		});
 		expect(result.ok).toBe(false);
 	});
 
 	it("rejects individual-use coupons when cart already has coupons", () => {
 		const cart = {
 			...cartWithItems([line("a", 1, 10_000)]),
-			coupons: [
-				{ code: "OTHER", discountAmount: money("USD", 100), freeShipping: false },
-			],
+			coupons: [{ code: "OTHER", discountAmount: money("USD", 100), freeShipping: false }],
 		};
 		const result = validateCoupon(baseCoupon({ individualUse: true }), { cart });
 		expect(result.ok).toBe(false);
@@ -105,10 +94,7 @@ describe("validateCoupon", () => {
 
 	it("rejects when product filter matches none of the cart lines", () => {
 		const cart = cartWithItems([line("a", 1, 10_000)]);
-		const result = validateCoupon(
-			baseCoupon({ includedProductIds: ["nonexistent"] }),
-			{ cart },
-		);
+		const result = validateCoupon(baseCoupon({ includedProductIds: ["nonexistent"] }), { cart });
 		expect(result.ok).toBe(false);
 	});
 
@@ -168,6 +154,42 @@ describe("resolveDiscount", () => {
 			cart,
 		);
 		expect(applied.discountAmount.amount).toBe(1_000); // 10% of 10_000, not 15_000
+		expect(applied.lineDiscounts?.["l-a"]?.amount).toBe(1_000);
+		expect(applied.lineDiscounts?.["l-b"]).toBeUndefined();
+	});
+
+	it("uses bounded largest-remainder allocation for a fixed cart discount", () => {
+		const cart = cartWithItems([line("a", 1, 10_000), line("b", 1, 10_000), line("c", 1, 1)]);
+		const applied = resolveDiscount(
+			baseCoupon({ discountType: "fixed_cart", discountValue: 10_002, currency: "USD" }),
+			cart,
+		);
+		expect(applied.discountAmount.amount).toBe(10_002);
+		expect(applied.lineDiscounts).toEqual({
+			"l-a": money("USD", 5_001),
+			"l-b": money("USD", 5_001),
+			"l-c": money("USD", 0),
+		});
+	});
+
+	it("caps stacked product coupons at their eligible remaining balances", () => {
+		const cart = cartWithItems([line("a", 1, 1_000), line("b", 1, 1_000)]);
+		const first = resolveDiscount(
+			baseCoupon({ discountType: "fixed_product", discountValue: 900, includedProductIds: ["a"] }),
+			cart,
+		);
+		const second = resolveDiscount(
+			baseCoupon({
+				code: "AGAIN",
+				discountType: "fixed_product",
+				discountValue: 900,
+				includedProductIds: ["a"],
+			}),
+			{ ...cart, coupons: [first] },
+		);
+		expect(second.discountAmount.amount).toBe(100);
+		expect(second.lineDiscounts?.["l-a"]?.amount).toBe(100);
+		expect(second.lineDiscounts?.["l-b"]?.amount).toBeUndefined();
 	});
 
 	it("free_shipping: flags shipping bypass, zero discount amount", () => {

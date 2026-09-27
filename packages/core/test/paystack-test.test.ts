@@ -12,6 +12,7 @@ import { getInventoryReservation } from "../src/inventory";
 import { conditionalStore } from "./helpers/conditional-store";
 import { validateSettingsKey } from "../src/settings/schema";
 import { refundOrder } from "../src/orders/refund";
+import { digest } from "../src/util/conditional";
 
 const key = "sk_test_FAKE000";
 const address = {
@@ -64,6 +65,12 @@ function setup(physical = false) {
 		orders: conditionalStore(["paymentReference", "orderNumber"]),
 		order_items: conditionalStore(),
 		customers: conditionalStore(["email"]),
+		commerce_outbox: conditionalStore(),
+		refunds: conditionalStore(["requestId", "providerRefundKey"]),
+		coupons: conditionalStore(["code"]),
+		coupon_usage: conditionalStore(),
+		tax_rates: conditionalStore(),
+		download_grants: conditionalStore(),
 		product_variants: conditionalStore(),
 		shipping_zones: conditionalStore(),
 		shipping_methods: conditionalStore(),
@@ -104,7 +111,13 @@ function setup(physical = false) {
 		log: { info() {}, warn() {}, error() {}, debug() {} },
 		content: {
 			async get() {
-				return { status: "published", data: structuredClone(product) };
+				return {
+					status: "published",
+					data: structuredClone(product),
+					taxonomies: {
+						product_category: structuredClone((product as any).product_categories ?? []),
+					},
+				};
 			},
 		},
 		http: {
@@ -216,6 +229,26 @@ async function webhook(ctx: PluginContext, reference: string) {
 }
 
 describe("Paystack test orchestration — native UPSERT/CAS semantics, fake HTTP only", () => {
+	it("re-stamps current CMS weight before repricing a weight-based shipment", async () => {
+		const h = setup(true);
+		h.product.weight_grams = 1_000;
+		h.cart.items[0]!.weightGrams = 1; // stale cart-add snapshot
+		h.cart.shippingMethod = { id: "flat", label: "Delivery", amount: money("ZAR", 1) };
+		h.storage.shipping_methods.rows.set("flat", {
+			id: "flat",
+			zoneId: "za",
+			title: "Delivery",
+			type: "weight_based",
+			enabled: true,
+			config: { type: "weight_based", base: money("ZAR", 0), perGram: 1, currency: "ZAR" },
+		});
+		await h.ctx.kv.set(cartKey("session"), h.cart);
+		const checkout = await session(h.ctx);
+		expect(checkout.total.amount).toBe(3_000); // 2,000 current item + 1,000 shipping
+		const attempt = [...h.storage.payment_attempts.rows.values()][0] as { cart: CartState };
+		expect(attempt.cart.items[0]?.weightGrams).toBe(1_000);
+	});
+
 	it("clears the purchased cart after repricing without clearing a newer cart", async () => {
 		const first = setup();
 		const paid = await session(first.ctx);
@@ -276,19 +309,19 @@ describe("Paystack test orchestration — native UPSERT/CAS semantics, fake HTTP
 		const [a, b] = await Promise.all([poll(h.ctx, s.orderDraftId), webhook(h.ctx, s.reference)]);
 		expect(a.status).toBe("ready");
 		expect(b.status).toBe(200);
-		const id = `test_${s.orderDraftId}`;
+		const id = `order_${await digest(s.orderDraftId)}`;
 		expect(h.storage.orders.rows.size).toBe(1);
 		expect(h.storage.order_items.rows.size).toBe(1);
 		expect((await getInventoryReservation(h.ctx, s.orderDraftId))?.status).toBe("consumed");
-		expect(h.kv.rows.get(`receipt-preview:${id}`)).toMatchObject({
+		expect(h.storage.commerce_outbox.rows.get(`order:${id}`)).toMatchObject({
 			testMode: true,
-			delivery: "disabled",
-			status: "preview_only",
+			status: "suppressed",
 		});
 		expect(h.storage.orders.rows.get(id)).toMatchObject({
-			status: "on-hold",
+			status: "processing",
 			paymentStatus: "paid",
-			paymentProvider: "paystack-test",
+			paymentProvider: "paystack",
+			paymentMode: "test",
 			metadata: { testMode: true, inventoryStatus: "consumed" },
 		});
 		await h.storage.orders.put(id, { ...h.storage.orders.rows.get(id), status: "cancelled" });
@@ -312,17 +345,21 @@ describe("Paystack test orchestration — native UPSERT/CAS semantics, fake HTTP
 			const s = await session(h.ctx);
 			let fail = true;
 			const store =
-				point === "outbox" ? h.kv : point === "marker" ? h.storage.payments : h.storage[point];
+				point === "outbox"
+					? h.storage.commerce_outbox
+					: point === "marker"
+						? h.storage.payments
+						: h.storage[point];
 			store.beforeWrite = (id, data) => {
 				if (
 					fail &&
-					(point !== "outbox" || id.startsWith("receipt-preview:")) &&
-					(point !== "marker" || data.status === "finalized_test")
+					(point !== "outbox" || id.startsWith("order:")) &&
+					(point !== "marker" || data.status === "finalized")
 				)
 					throw Error("injected write failure");
 			};
 			expect((await poll(h.ctx, s.orderDraftId)).status).toBe("pending");
-			expect([...h.storage.payments.rows.values()][0]?.status).not.toBe("finalized_test");
+			expect([...h.storage.payments.rows.values()][0]?.status).not.toBe("finalized");
 			const order = [...h.storage.orders.rows.values()][0];
 			if (order) await h.storage.orders.put(order.id, { ...order, status: "cancelled" });
 			fail = false;
@@ -358,7 +395,9 @@ describe("Paystack test orchestration — native UPSERT/CAS semantics, fake HTTP
 			if (afterCommit) h.kv.afterWrite = hook;
 			else h.kv.beforeWrite = hook;
 			expect((await poll(h.ctx, s.orderDraftId)).status).toBe("pending");
-			expect(h.storage.payments.rows.get(`test_${s.orderDraftId}`).status).toBe("verified_test");
+			expect(h.storage.payments.rows.get(`order_${await digest(s.orderDraftId)}`).status).toBe(
+				"verified",
+			);
 			expect((await poll(h.ctx, s.orderDraftId)).status).toBe("ready");
 			expect((await getInventoryReservation(h.ctx, s.orderDraftId))?.status).toBe("consumed");
 			expect(
@@ -387,19 +426,19 @@ describe("Paystack test orchestration — native UPSERT/CAS semantics, fake HTTP
 		expect((await poll(h.ctx, s.orderDraftId)).status).toBe("failed");
 		expect((await session(h.ctx)).reference).not.toBe(s.reference);
 	});
-	it("requires CAS and refuses test refunds without any provider call", async () => {
+	it("requires CAS and refuses invalid refunds before any provider call", async () => {
 		const h = setup();
 		const s = await session(h.ctx);
 		await poll(h.ctx, s.orderDraftId);
 		const count = h.calls.length;
 		await expect(
 			refundOrder(h.ctx, {
-				orderId: `test_${s.orderDraftId}`,
-				amount: money("ZAR", 1),
+				orderId: `order_${await digest(s.orderDraftId)}`,
+				amount: money("ZAR", 0),
 				client: { secretKey: "sk_test_unused" },
 				idempotencyKey: "refund",
 			}),
-		).rejects.toThrow("refunds are disabled");
+		).rejects.toThrow("positive safe integer");
 		expect(h.calls.length).toBe(count);
 		const missing = setup();
 		(missing.ctx.kv as any).compareAndSet = undefined;
@@ -490,12 +529,12 @@ describe("Paystack test orchestration — native UPSERT/CAS semantics, fake HTTP
 			const result = await poll(h.ctx, s.orderDraftId);
 			expect(result.status).toBe("ready");
 			expect(result.manualReview).toBe(true);
-			expect(h.storage.payments.rows.get(`test_${s.orderDraftId}`).inventoryStatus).toBe(
-				"manual_review",
-			);
+			expect(
+				h.storage.payments.rows.get(`order_${await digest(s.orderDraftId)}`).inventoryStatus,
+			).toBe("manual_review");
 		});
 	}
-	it("rejects live keys, HTTP callbacks, untrusted checkout URLs and invalid capabilities before unsafe work", async () => {
+	it("rejects key/mode mismatch, HTTP callbacks, untrusted checkout URLs and invalid capabilities before unsafe work", async () => {
 		const h = setup();
 		await expect(
 			initialize(h.ctx, "sk_live_fake", {
@@ -503,7 +542,7 @@ describe("Paystack test orchestration — native UPSERT/CAS semantics, fake HTTP
 				cart: h.cart,
 				callbackUrl: "https://shop.test/return",
 			}),
-		).rejects.toThrow("live mode disabled");
+		).rejects.toThrow("test secret key required");
 		await expect(
 			initialize(h.ctx, key, {
 				orderDraftId: "draft",
@@ -556,8 +595,13 @@ describe("authoritative shipping, tax and backend field schemas", () => {
 		h.kv.rows.set("settings:taxAppliesToShipping", true);
 		expect((await session(h.ctx)).total.amount).toBe(2875);
 	});
+	it("reprices the selected shipping method at its current rate before initialize", async () => {
+		const h = setup(true);
+		h.storage.shipping_methods.rows.get("flat").config.amount.amount = 800;
+		const current = await session(h.ctx);
+		expect(current.total.amount).toBe(2800);
+	});
 	for (const change of [
-		"stale",
 		"disabled",
 		"destination",
 		"table",
@@ -570,7 +614,6 @@ describe("authoritative shipping, tax and backend field schemas", () => {
 		it(`rejects ${change} shipping before initialize`, async () => {
 			const h = setup(true);
 			const method = h.storage.shipping_methods.rows.get("flat");
-			if (change === "stale") method.config.amount.amount = 800;
 			if (change === "disabled") method.enabled = false;
 			if (change === "destination") h.cart.shippingAddress = { ...address, country: "US" };
 			if (change === "table") method.config.type = method.type = "weight_based";
@@ -641,21 +684,24 @@ describe("authoritative shipping, tax and backend field schemas", () => {
 		expect((await create(h.ctx)).status).toBeGreaterThanOrEqual(400);
 		expect(h.calls.length).toBe(0);
 	});
-	it("rejects unsupported authoritative product semantics, coupons and oversized carts", async () => {
+	it("supports native tax/untracked stock, while retaining unsupported provider safeguards", async () => {
 		for (const fields of [
-			{ type: "subscription" },
+			{ subscription_config: { interval: "month", intervalCount: 1 } },
 			{ vendor_id: "vendor" },
-			{ tax_class: "zero-rate" },
-			{ manage_stock: false },
 		]) {
 			const h = setup();
 			Object.assign(h.product, fields);
 			expect((await create(h.ctx)).status).toBeGreaterThanOrEqual(400);
 			expect(h.calls.length).toBe(0);
 		}
+		for (const fields of [{ tax_class: "zero-rate" }, { manage_stock: false }]) {
+			const h = setup();
+			Object.assign(h.product, fields);
+			expect((await create(h.ctx)).status).toBe(200);
+		}
 		const coupons = setup();
 		coupons.cart.coupons = [{ code: "FREE", discountAmount: money("ZAR", 1) }] as any;
-		expect((await create(coupons.ctx)).status).toBe(501);
+		expect((await create(coupons.ctx)).status).toBe(409);
 		expect(coupons.calls.length).toBe(0);
 		const oversized = setup();
 		oversized.cart.items = Array.from({ length: 101 }, (_, i) => ({
@@ -665,17 +711,23 @@ describe("authoritative shipping, tax and backend field schemas", () => {
 		expect((await create(oversized.ctx)).status).toBe(409);
 		expect(oversized.calls.length).toBe(0);
 	});
-	it("accepts qualifying free shipping and rejects unsupported checkout settings/features", async () => {
+	it("accepts qualifying free shipping and supported native tax settings", async () => {
 		const h = setup(true);
 		const method = h.storage.shipping_methods.rows.get("flat");
 		method.type = "free_shipping";
 		method.config = { type: "free_shipping", minimumAmount: money("ZAR", 1000) };
 		h.cart.shippingMethod!.amount.amount = 0;
 		expect((await session(h.ctx)).total.amount).toBe(2000);
-		for (const mode of ["table", "stripe_tax", "typo"]) {
+		const table = setup();
+		table.kv.rows.set("settings:taxMode", "table");
+		expect((await session(table.ctx)).total.amount).toBe(2000);
+		for (const [mode, status] of [
+			["stripe_tax", 501],
+			["typo", 503],
+		] as const) {
 			const invalid = setup();
 			invalid.kv.rows.set("settings:taxMode", mode);
-			expect((await create(invalid.ctx)).status).toBe(501);
+			expect((await create(invalid.ctx)).status).toBe(status);
 			expect(invalid.calls.length).toBe(0);
 		}
 		for (const provider of ["paystack-live", "paystack-mock", "", false]) {
@@ -688,6 +740,104 @@ describe("authoritative shipping, tax and backend field schemas", () => {
 		expect(validateSettingsKey("paystackSecretKey", key).ok).toBe(true);
 		expect(validateSettingsKey("paymentProvider", "paystack-mock").ok).toBe(false);
 		expect(validateSettingsKey("flatTaxRatePercent", -1).ok).toBe(false);
+	});
+	it("requires a fresh valid coupon for coupon-gated free shipping", async () => {
+		const h = setup(true);
+		const method = h.storage.shipping_methods.rows.get("flat");
+		method.type = "free_shipping";
+		method.config = { type: "free_shipping", requiresCoupon: true };
+		h.cart.shippingMethod!.amount.amount = 0;
+		expect((await create(h.ctx)).status).toBeGreaterThanOrEqual(400);
+		h.storage.coupons.rows.set("free", {
+			id: "free",
+			code: "FREE",
+			discountType: "free_shipping",
+			discountValue: 0,
+			status: "active",
+			excludeSaleItems: false,
+			usageCount: 0,
+			individualUse: false,
+			createdAt: "2025-01-01",
+			updatedAt: "2025-01-01",
+		});
+		h.cart.coupons = [{ code: "FREE", discountAmount: money("ZAR", 0), freeShipping: true }];
+		const result = await create(h.ctx);
+		expect(result.status).toBe(200);
+		expect(((await result.json()) as { total: { amount: number } }).total.amount).toBe(2000);
+	});
+	it("revalidates coupon categories and per-customer usage against current data", async () => {
+		const basic = {
+			id: "coupon",
+			code: "SAVE",
+			discountType: "percent_cart",
+			discountValue: 10,
+			status: "active",
+			excludeSaleItems: false,
+			usageCount: 0,
+			individualUse: false,
+			createdAt: "2025-01-01",
+			updatedAt: "2025-01-01",
+		};
+		const permitted = setup();
+		permitted.storage.coupons.rows.set("coupon", basic);
+		permitted.cart.coupons = [
+			{ code: "SAVE", discountAmount: money("ZAR", 1), freeShipping: false },
+		];
+		expect((await session(permitted.ctx)).total.amount).toBe(1800);
+
+		const excluded = setup();
+		excluded.product.product_categories = ["forbidden"];
+		excluded.storage.coupons.rows.set("coupon", {
+			...basic,
+			excludedCategorySlugs: ["forbidden"],
+		});
+		excluded.cart.coupons = [
+			{ code: "SAVE", discountAmount: money("ZAR", 1), freeShipping: false },
+		];
+		expect((await create(excluded.ctx)).status).toBe(409);
+
+		const exhausted = setup();
+		exhausted.storage.coupons.rows.set("coupon", { ...basic, usageLimitPerCustomer: 1 });
+		exhausted.storage.customers.rows.set("customer", {
+			id: "customer",
+			email: "buyer@example.test",
+		});
+		exhausted.storage.coupon_usage.rows.set("usage", {
+			id: "usage",
+			couponCode: "SAVE",
+			customerId: "customer",
+			orderId: "old-order",
+		});
+		exhausted.cart.coupons = [
+			{ code: "SAVE", discountAmount: money("ZAR", 1), freeShipping: false },
+		];
+		expect((await create(exhausted.ctx)).status).toBe(409);
+	});
+	it("uses the authoritative product tax class in table tax", async () => {
+		const h = setup();
+		h.product.tax_class = "zero-rate";
+		h.kv.rows.set("settings:taxMode", "table");
+		h.storage.tax_rates.rows.set("standard", {
+			id: "standard",
+			country: "ZA",
+			taxClass: "standard",
+			rate: 15,
+			name: "Standard",
+			compound: false,
+			appliesToShipping: false,
+			priority: 1,
+		});
+		h.storage.tax_rates.rows.set("zero", {
+			id: "zero",
+			country: "ZA",
+			taxClass: "zero-rate",
+			rate: 0,
+			name: "Zero",
+			compound: false,
+			appliesToShipping: false,
+			priority: 1,
+		});
+		expect((await session(h.ctx)).total.amount).toBe(2000);
 	});
 	it("cart/contact destination changes cannot keep a stale rate at payment time", async () => {
 		const h = setup(true);

@@ -16,6 +16,7 @@ import { CouponsPage } from "./pages/CouponsPage";
 import { CustomersPage } from "./pages/CustomersPage";
 import { MenusPage } from "./pages/MenusPage";
 import { OrdersPage } from "./pages/OrdersPage";
+import { PaymentOperationsPage } from "./pages/PaymentOperationsPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { ReviewsPage } from "./pages/ReviewsPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -58,6 +59,7 @@ export const pages: Record<string, ComponentType> = {
 	// `CustomersPage` render the detail view inline when the hash matches
 	// `#/orders/<id>` / `#/customers/<id>` instead.
 	"/orders": withPortals(OrdersPage),
+	"/payment-operations": withPortals(PaymentOperationsPage),
 	"/customers": withPortals(CustomersPage),
 	"/coupons": withPortals(CouponsPage),
 	"/shipping": withPortals(ShippingPage),

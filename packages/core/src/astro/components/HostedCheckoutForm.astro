@@ -1,18 +1,22 @@
 ---
-/** Hosted Stripe or Paystack TEST checkout handoff. */
+/** Hosted Stripe or Paystack checkout handoff. Credentials and prices stay server-side. */
 export interface Props {
-  digitalOnly?: boolean;
-  paymentProvider?: "stripe" | "paystack-test";
+	digitalOnly?: boolean;
+	paymentProvider?: "stripe" | "paystack" | "paystack-test";
+	paystackMode?: "test" | "live";
 }
 
-const { digitalOnly = false, paymentProvider = "stripe" } = Astro.props;
-const isPaystackTest = paymentProvider === "paystack-test";
+const { digitalOnly = false, paymentProvider = "stripe", paystackMode = "test" } = Astro.props;
+const isPaystack = paymentProvider === "paystack" || paymentProvider === "paystack-test";
+const effectivePaystackMode = paymentProvider === "paystack-test" ? "test" : paystackMode;
+const isPaystackTest = isPaystack && effectivePaystackMode === "test";
 ---
 
 <section
   class="hc"
   data-digital-only={digitalOnly ? "1" : "0"}
   data-provider={paymentProvider}
+  data-paystack-mode={isPaystack ? effectivePaystackMode : undefined}
 >
   {isPaystackTest && (
     <div class="hc-test-notice" role="note">
@@ -21,7 +25,7 @@ const isPaystackTest = paymentProvider === "paystack-test";
     </div>
   )}
 
-  {isPaystackTest ? (
+  {isPaystack ? (
     <div class="hc-step" id="hc-step-details">
       <div class="hc-step-header">
         <span class="hc-step-num">1</span>
@@ -50,7 +54,7 @@ const isPaystackTest = paymentProvider === "paystack-test";
           </div>
           <div class="hc-row-2">
             <label class="hc-label"><span>Postal code</span><input required id="hc-postal" autocomplete="shipping postal-code" maxlength="24" /></label>
-            <label class="hc-label"><span>Country <small>(ISO-2)</small></span><input required id="hc-country" value="ZA" pattern="[A-Za-z]{2}" maxlength="2" autocomplete="shipping country" /></label>
+            <label class="hc-label"><span>Country <small>(ISO-2)</small></span><input required id="hc-country" placeholder="ZA" pattern="[A-Za-z]{2}" maxlength="2" autocomplete="shipping country" /></label>
           </div>
         </fieldset>
 
@@ -73,7 +77,7 @@ const isPaystackTest = paymentProvider === "paystack-test";
           </div>
           <div class="hc-row-2">
             <label class="hc-label"><span>Postal code</span><input id="hc-b-postal" autocomplete="billing postal-code" maxlength="24" /></label>
-            <label class="hc-label"><span>Country <small>(ISO-2)</small></span><input id="hc-b-country" value="ZA" pattern="[A-Za-z]{2}" maxlength="2" autocomplete="billing country" /></label>
+            <label class="hc-label"><span>Country <small>(ISO-2)</small></span><input id="hc-b-country" placeholder="ZA" pattern="[A-Za-z]{2}" maxlength="2" autocomplete="billing country" /></label>
           </div>
         </fieldset>
 
@@ -110,20 +114,26 @@ const isPaystackTest = paymentProvider === "paystack-test";
     </div>
   )}
 
-  <div class="hc-step" id="hc-step-pay" data-ready={!isPaystackTest && digitalOnly ? "1" : "0"}>
+  <div class="hc-step" id="hc-step-pay" data-ready={!isPaystack && digitalOnly ? "1" : "0"}>
     <div class="hc-step-header">
-      <span class="hc-step-num">{isPaystackTest ? (digitalOnly ? 2 : 3) : (digitalOnly ? 1 : 3)}</span>
+      <span class="hc-step-num">{isPaystack ? (digitalOnly ? 2 : 3) : (digitalOnly ? 1 : 3)}</span>
       <h2 class="hc-step-title">{isPaystackTest ? "Test payment" : "Pay securely"}</h2>
     </div>
     <p class="hc-step-hint" id="hc-pay-hint">
-      {isPaystackTest
-        ? "You'll continue to Paystack's test checkout. Completion remains pending until the shop verifies it with Paystack."
+      {isPaystack
+        ? isPaystackTest
+          ? "You'll continue to Paystack's test checkout. Completion remains pending until the shop verifies it with Paystack."
+          : "You'll continue to Paystack's secure checkout. Your order remains pending until the shop verifies the payment."
         : `You'll be redirected to Stripe to enter your email, ${digitalOnly ? "billing address, " : "full address, "}and card details. We never see your card.`}
     </p>
+    {!isPaystack && <label class="hc-field">Email for coupon eligibility
+      <input id="hc-stripe-email" type="email" autocomplete="email" maxlength="254" />
+      <small>Optional unless your coupon is limited per customer. Stripe will receive this email for checkout.</small>
+    </label>}
     <p id="hc-pay-error" class="hc-error" role="alert"></p>
-    <button id="hc-pay-btn" type="button" class="btn-primary hc-submit" disabled={isPaystackTest || !digitalOnly}>
+    <button id="hc-pay-btn" type="button" class="btn-primary hc-submit" disabled={isPaystack || !digitalOnly}>
       <span class="hc-lock" aria-hidden="true">🔒</span>
-      {isPaystackTest ? "Continue to Paystack TEST →" : "Pay with Stripe →"}
+      {isPaystack ? (isPaystackTest ? "Continue to Paystack TEST →" : "Pay with Paystack →") : "Pay with Stripe →"}
     </button>
   </div>
 </section>
@@ -170,7 +180,12 @@ const isPaystackTest = paymentProvider === "paystack-test";
 
   const API = "/_emdash/api/plugins/dashcommerce";
   const root = document.querySelector<HTMLElement>(".hc");
-  const provider = root?.dataset.provider === "paystack-test" ? "paystack-test" : "stripe";
+  const configuredProvider = root?.dataset.provider;
+  const provider = configuredProvider === "paystack" || configuredProvider === "paystack-test"
+    ? configuredProvider
+    : "stripe";
+  const isPaystack = provider === "paystack" || provider === "paystack-test";
+  const paystackMode = provider === "paystack-test" || root?.dataset.paystackMode !== "live" ? "test" : "live";
   let digitalOnly = root?.dataset.digitalOnly === "1";
   let details: CheckoutDetails | null = null;
 
@@ -206,7 +221,7 @@ const isPaystackTest = paymentProvider === "paystack-test";
       setPayReady(true);
     } else {
       if (payStepNum) payStepNum.textContent = "2";
-      if (detailsBtn) detailsBtn.textContent = "Continue to test payment →";
+      if (detailsBtn) detailsBtn.textContent = paystackMode === "test" ? "Continue to test payment →" : "Continue to payment →";
     }
   }
 
@@ -279,7 +294,12 @@ const isPaystackTest = paymentProvider === "paystack-test";
     } catch (error) {
       setError(detailsErr, error instanceof Error ? error.message : "Could not save checkout details.");
     } finally {
-      if (detailsBtn) { detailsBtn.disabled = false; detailsBtn.textContent = digitalOnly ? "Continue to test payment →" : "Continue to shipping →"; }
+      if (detailsBtn) {
+        detailsBtn.disabled = false;
+        detailsBtn.textContent = digitalOnly
+          ? (paystackMode === "test" ? "Continue to test payment →" : "Continue to payment →")
+          : "Continue to shipping →";
+      }
     }
   });
 
@@ -345,14 +365,19 @@ const isPaystackTest = paymentProvider === "paystack-test";
   }
 
   payBtn?.addEventListener("click", async () => {
+    const stripeEmail = document.getElementById("hc-stripe-email") as HTMLInputElement | null;
+    if (stripeEmail && !stripeEmail.checkValidity()) { stripeEmail.reportValidity(); return; }
+    const customerEmail = details?.customerEmail ?? stripeEmail?.value.trim();
     setError(payErr, null); payBtn.disabled = true;
-    payBtn.textContent = provider === "paystack-test" ? "Opening Paystack TEST…" : "Redirecting to Stripe…";
+    payBtn.textContent = isPaystack
+      ? (paystackMode === "test" ? "Opening Paystack TEST…" : "Opening Paystack…")
+      : "Redirecting to Stripe…";
     try {
       const res = await fetch(`${API}/checkout/create-session`, {
         method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
         // Addresses were saved through cart/contact; checkout revalidates that
         // server-side cart and rejects duplicated/client-supplied pricing fields.
-        body: JSON.stringify(details ? { customerEmail: details.customerEmail } : {}),
+        body: JSON.stringify(customerEmail ? { customerEmail } : {}),
       });
       if (!res.ok) {
         const failure = await res.clone().json().catch(() => null) as { code?: string; orderDraftId?: string } | null;
@@ -367,20 +392,44 @@ const isPaystackTest = paymentProvider === "paystack-test";
         }
         throw new Error(await errorFrom(res, "Payment setup failed"));
       }
-      const body = await res.json() as { provider?: string; url?: string; orderDraftId?: string };
+      const body = await res.json() as {
+        provider?: string;
+        mode?: "test" | "live";
+        testMode?: boolean;
+        url?: string;
+        orderDraftId?: string;
+      };
       if (!body.url || !body.orderDraftId) throw new Error("Checkout did not return a secure payment link.");
       const target = new URL(body.url);
-      const expectedHost = provider === "paystack-test" ? "checkout.paystack.com" : "checkout.stripe.com";
+      const expectedHost = isPaystack ? "checkout.paystack.com" : "checkout.stripe.com";
       if (target.protocol !== "https:" || target.hostname !== expectedHost || target.username || target.password || target.port) {
         throw new Error("Checkout returned an unexpected payment destination.");
       }
-      if (provider === "paystack-test" && body.provider !== "paystack-test") throw new Error("Checkout provider mismatch; payment was not started.");
+      if (isPaystack) {
+        const compatibleProvider = provider === "paystack-test"
+          ? body.provider === "paystack-test"
+          : body.provider === "paystack";
+        if (!compatibleProvider) throw new Error("Checkout provider mismatch; payment was not started.");
+        // New Paystack responses bind the environment explicitly. The legacy
+        // alias predates `mode`, but is unconditionally test-only.
+        if (
+          (provider === "paystack" && body.mode !== paystackMode) ||
+          (provider === "paystack-test" && body.mode !== undefined && body.mode !== "test")
+        ) {
+          throw new Error("Checkout environment mismatch; payment was not started.");
+        }
+        if (body.testMode !== undefined && body.testMode !== (paystackMode === "test")) {
+          throw new Error("Checkout environment mismatch; payment was not started.");
+        }
+      }
       if (provider === "stripe" && body.provider && body.provider !== "stripe") throw new Error("Checkout provider mismatch; payment was not started.");
       window.location.assign(target.href);
     } catch (error) {
       setError(payErr, error instanceof Error ? error.message : "Could not start checkout.");
       payBtn.disabled = false;
-      payBtn.innerHTML = provider === "paystack-test" ? '<span class="hc-lock" aria-hidden="true">🔒</span>Continue to Paystack TEST →' : '<span class="hc-lock" aria-hidden="true">🔒</span>Pay with Stripe →';
+      payBtn.innerHTML = isPaystack
+        ? `<span class="hc-lock" aria-hidden="true">🔒</span>${paystackMode === "test" ? "Continue to Paystack TEST →" : "Pay with Paystack →"}`
+        : '<span class="hc-lock" aria-hidden="true">🔒</span>Pay with Stripe →';
     }
   });
 </script>

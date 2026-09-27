@@ -12,6 +12,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CheckoutMode, PaystackMode, TaxMode } from "../../settings/schema";
 import {
 	Alert,
 	Button,
@@ -28,7 +29,6 @@ import {
 	toast,
 	usePluginAPI,
 } from "../kit";
-import type { CheckoutMode, TaxMode } from "../../settings/schema";
 
 type Group = "store" | "payments" | "reviews" | "downloads" | "marketing" | "connect" | "stripe";
 
@@ -48,7 +48,7 @@ const GROUPS: GroupSpec[] = [
 		id: "payments",
 		title: "Payment provider",
 		description:
-			"Paystack is test-mode only. No live Paystack payments, automatic fulfilment or email delivery are enabled.",
+			"Choose a gateway and configure its environment explicitly. Shipping, native tax and coupons continue to use the store settings.",
 	},
 	{
 		id: "stripe",
@@ -96,7 +96,11 @@ interface SettingsShape {
 	connectPlatformFeePercent: number | null;
 	// Secrets are never sent down (server omits them), but the draft
 	// accepts strings when the operator types a new value to commit.
-	paymentProvider: "stripe" | "paystack-test" | null;
+	paymentProvider: "stripe" | "paystack" | "paystack-test" | null;
+	receiptEmailEnabled: boolean | null;
+	paystackMode: PaystackMode | null;
+	paystackTestSecretKey: string | null;
+	paystackLiveSecretKey: string | null;
 	paystackSecretKey: string | null;
 	stripeSecretKey: string | null;
 	stripePublishableKey: string | null;
@@ -228,18 +232,33 @@ export function SettingsPage() {
 	const connectEnabled = !!effective("connectEnabled");
 	const enabledCurrencies = (effective("enabledCurrencies") as string[] | null | undefined) ?? [];
 
-	const needsStripeKey = !saved._secrets?.stripeSecretKey?.isSet;
+	const selectedProvider = effective("paymentProvider") ?? "stripe";
+	const selectedPaystackMode: PaystackMode =
+		selectedProvider === "paystack-test" ? "test" : (effective("paystackMode") ?? "test");
+	const hasPaystackTestKey =
+		saved._secrets?.paystackTestSecretKey?.isSet || saved._secrets?.paystackSecretKey?.isSet;
+	const needsPaymentKey =
+		(selectedProvider === "stripe" && !saved._secrets?.stripeSecretKey?.isSet) ||
+		(selectedProvider !== "stripe" &&
+			(selectedPaystackMode === "live"
+				? !saved._secrets?.paystackLiveSecretKey?.isSet
+				: !hasPaystackTestKey));
 
 	return (
 		<div style={{ display: "flex", flexDirection: "column", gap: 16, paddingBottom: 80 }}>
-			{needsStripeKey && (
-				<Alert type="warning" title="Finish setup">
-					Add a Stripe secret key below to start accepting payments. Test keys start with{" "}
-					<code>sk_test_</code>. Grab them at{" "}
-					<a href="https://dashboard.stripe.com/test/apikeys" target="_blank" rel="noreferrer">
-						dashboard.stripe.com/test/apikeys
-					</a>
-					.
+			{needsPaymentKey && (
+				<Alert type="warning" title="Finish payment setup">
+					{selectedProvider === "stripe" ? (
+						<>
+							Add a Stripe secret key below to start accepting payments. Test keys start with{" "}
+							<code>sk_test_</code>.
+						</>
+					) : (
+						<>
+							Add the Paystack <strong>{selectedPaystackMode}</strong> secret key below. The
+							selected mode never falls back to a key from the other environment.
+						</>
+					)}
 				</Alert>
 			)}
 
@@ -357,35 +376,98 @@ function GroupBody({
 	}
 
 	if (group === "payments") {
+		const provider = eff("paymentProvider", saved, draft) ?? "stripe";
+		const configuredMode = (eff("paystackMode", saved, draft) as PaystackMode | null) ?? "test";
+		const mode: PaystackMode = provider === "paystack-test" ? "test" : configuredMode;
 		return (
 			<>
 				<FormField
 					label="Provider"
 					error={errors.paymentProvider}
-					description="Paystack requires ZAR prices, hosted checkout and a test secret. Coupons, subscriptions, Connect and advanced tax modes are not supported by the test integration."
+					description="Paystack uses hosted checkout. Stripe-only Elements, Stripe Tax, subscriptions and Connect remain unavailable when Paystack is selected."
 				>
 					<Select
-						value={eff("paymentProvider", saved, draft) ?? "stripe"}
+						value={provider}
 						options={[
 							{ value: "stripe", label: "Stripe" },
-							{ value: "paystack-test", label: "Paystack — test mode only" },
+							{ value: "paystack", label: "Paystack" },
+							{ value: "paystack-test", label: "Paystack — legacy test alias" },
 						]}
 						onChange={(e) => {
-							setField("paymentProvider", e.currentTarget.value as "stripe" | "paystack-test");
+							setField(
+								"paymentProvider",
+								e.currentTarget.value as "stripe" | "paystack" | "paystack-test",
+							);
 						}}
 						disabled={disabled}
 					/>
 				</FormField>
-				<SecretField
-					keyName="paystackSecretKey"
-					label="Paystack test secret key"
-					description="sk_test_ only. Also used to verify Paystack webhook signatures. Stored encrypted by EmDash; configure EMDASH_ENCRYPTION_KEY first."
-					saved={saved}
-					draft={draft}
-					errors={errors}
-					setField={setField}
-					disabled={disabled}
-				/>
+				{provider !== "stripe" && (
+					<>
+						<FormField
+							label="Paystack mode"
+							error={errors.paystackMode}
+							description={
+								provider === "paystack-test"
+									? "The legacy paystack-test provider always uses test mode. Choose Paystack above to configure an explicit mode."
+									: "The mode selects only its matching secret. Changing it does not relabel existing payments or orders."
+							}
+						>
+							<Select
+								value={mode}
+								options={[
+									{ value: "test", label: "Test — no real payment" },
+									{ value: "live", label: "Live" },
+								]}
+								onChange={(e) => setField("paystackMode", e.currentTarget.value as PaystackMode)}
+								disabled={disabled || provider === "paystack-test"}
+							/>
+						</FormField>
+						{mode === "live" && (
+							<Alert type="warning" title="Live payments selected">
+								Confirm the live key and webhook configuration before saving. Test credentials are
+								never used as a live fallback.
+							</Alert>
+						)}
+						<SecretField
+							keyName="paystackTestSecretKey"
+							label="Paystack test secret key"
+							description="sk_test_ only. Used for test checkout and test webhook verification."
+							saved={saved}
+							draft={draft}
+							errors={errors}
+							setField={setField}
+							disabled={disabled}
+						/>
+						<SecretField
+							keyName="paystackLiveSecretKey"
+							label="Paystack live secret key"
+							description="sk_live_ only. Stored separately and used only when Paystack live mode is selected."
+							saved={saved}
+							draft={draft}
+							errors={errors}
+							setField={setField}
+							disabled={disabled}
+						/>
+						{saved._secrets?.paystackSecretKey?.isSet && (
+							<Alert type="info" title="Legacy test key retained">
+								The old Paystack key remains a test-only fallback. Save a test key above when
+								convenient; it can never be used for live payments.
+							</Alert>
+						)}
+					</>
+				)}
+				<FormField
+					description="Allows a configured host mail worker to deliver queued live receipts. This setting alone does not send email; EmDash mail transport and an explicit dispatcher are also required. Test receipts are always suppressed."
+					error={errors.receiptEmailEnabled}
+				>
+					<Toggle
+						label="Allow native receipt email delivery"
+						checked={!!eff("receiptEmailEnabled", saved, draft)}
+						onChange={(value) => setField("receiptEmailEnabled", value)}
+						disabled={disabled}
+					/>
+				</FormField>
 			</>
 		);
 	}
@@ -569,17 +651,22 @@ function GroupBody({
 	}
 
 	if (group === "connect") {
+		const stripeSelected = (eff("paymentProvider", saved, draft) ?? "stripe") === "stripe";
 		return (
 			<>
 				<FormField
-					description="When on, products can be assigned to vendors and payouts split on each sale."
+					description={
+						stripeSelected
+							? "When on, products can be assigned to vendors and payouts split on each sale."
+							: "Stripe Connect is unavailable with Paystack. Existing configuration is preserved."
+					}
 					error={errors.connectEnabled}
 				>
 					<Toggle
 						label="Enable multi-vendor marketplace"
 						checked={connectEnabled}
 						onChange={(v) => setField("connectEnabled", v)}
-						disabled={disabled}
+						disabled={disabled || !stripeSelected}
 					/>
 				</FormField>
 				<FormField
@@ -598,7 +685,7 @@ function GroupBody({
 						max={100}
 						step={0.1}
 						suffix="%"
-						disabled={disabled || !connectEnabled}
+						disabled={disabled || !stripeSelected || !connectEnabled}
 						{...(errors.connectPlatformFeePercent ? { invalid: true } : {})}
 					/>
 				</FormField>
@@ -619,7 +706,12 @@ function SecretField({
 	setField,
 	disabled,
 }: {
-	keyName: "stripeSecretKey" | "stripeWebhookSecret" | "paystackSecretKey";
+	keyName:
+		| "stripeSecretKey"
+		| "stripeWebhookSecret"
+		| "paystackTestSecretKey"
+		| "paystackLiveSecretKey"
+		| "paystackSecretKey";
 	label: string;
 	description?: string;
 	saved: SettingsShape;
@@ -687,7 +779,7 @@ function StripePing() {
 			<Button variant="secondary" onClick={run} disabled={pending}>
 				{pending ? "Testing…" : "Test Stripe connection"}
 			</Button>
-			{result && result.ok && (
+			{result?.ok && (
 				<Alert type="success" title="Connected">
 					Account <code>{result.accountId}</code> · charges{" "}
 					{result.chargesEnabled ? "enabled" : "disabled"} · payouts{" "}

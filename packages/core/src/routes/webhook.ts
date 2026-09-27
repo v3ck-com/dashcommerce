@@ -19,41 +19,46 @@
  */
 
 import type { PluginContext, RouteContext, StorageCollection } from "emdash";
-import { randomId } from "../util/ids";
-import { isUniqueViolation } from "../util/storage";
-import type { CartState, StripeEventRecord } from "../types";
 import { deleteLock, getLock } from "../cart/lock";
+import { releaseCouponClaims } from "../coupons/reservations";
 import { clear as clearCart } from "../cart/store";
+import { sendSubscriptionRenewed, sendVendorActivated, sendVendorPayout } from "../emails";
 import { createOrderFromPaymentIntent, findOrderByPaymentIntent } from "../orders/create";
+import { clearPurchasedCart } from "../orders/finalize";
+import { syncPaystackRefund } from "../orders/refund";
+import { finalizePaystack } from "../orders/paystack";
 import { recordRefundFromWebhook } from "../orders/refund";
-import { verifyStripeSignature } from "../stripe/webhook-verify";
-import type { StripePaymentIntent } from "../stripe/payment-intents";
-import { retrievePaymentIntent } from "../stripe/payment-intents";
+import { PaymentProviderError } from "../payment-provider";
+import { resolvePaystackKey } from "../payment-provider";
+import {
+	attemptForReference,
+	attemptMode,
+	reconcileAttempt,
+	retrievePaystackRefund,
+	verifySignature,
+} from "../payment-provider/paystack-test";
 import type { StripeCheckoutSession, StripeSessionAddress } from "../stripe/checkout-sessions";
 import type { StripeClientOptions } from "../stripe/client";
-import type { StripeRefund } from "../stripe/refunds";
 import type { StripeAccount, StripePayout } from "../stripe/connect";
+import type { StripePaymentIntent } from "../stripe/payment-intents";
+import { retrievePaymentIntent } from "../stripe/payment-intents";
+import type { StripeRefund } from "../stripe/refunds";
 import type { StripeInvoice, StripeSubscription } from "../stripe/subscriptions";
-import type { Address, CountryCode, Customer } from "../types";
-import { findVendorByStripeAccountId, upsertVendorFromStripeAccount } from "../vendors/onboarding";
-import { recordPayoutFromStripe } from "../vendors/payouts";
+import { verifyStripeSignature } from "../stripe/webhook-verify";
 import {
+	findSubscription,
 	subsStore,
 	upsertFromStripe,
 	upsertInvoiceFromStripe,
-	findSubscription,
 } from "../subscriptions/create";
 import { handleInvoicePaymentFailed } from "../subscriptions/dunning";
-import { sendSubscriptionRenewed, sendVendorActivated, sendVendorPayout } from "../emails";
-import { draftKey, type CheckoutDraftSnapshot } from "./checkout";
-import { PaymentProviderError } from "../payment-provider";
-import {
-	attemptForReference,
-	reconcileAttempt,
-	verifySignature,
-	testKey,
-} from "../payment-provider/paystack-test";
-import { finalizePaystackTest } from "../orders/paystack";
+import type { CartState, Order, PaymentRecord, Refund, StripeEventRecord } from "../types";
+import type { Address, CountryCode, Customer } from "../types";
+import { randomId } from "../util/ids";
+import { isUniqueViolation } from "../util/storage";
+import { findVendorByStripeAccountId, upsertVendorFromStripeAccount } from "../vendors/onboarding";
+import { recordPayoutFromStripe } from "../vendors/payouts";
+import { type CheckoutDraftSnapshot, draftKey } from "./checkout";
 
 type StripeEventsStore = StorageCollection<StripeEventRecord>;
 function stripeEventsStore(ctx: PluginContext): StripeEventsStore {
@@ -96,6 +101,17 @@ async function recordStripeEvent(
 	}
 }
 
+async function settledOrder(ctx: PluginContext, order: Order | null): Promise<boolean> {
+	if (!order) return false;
+	if (!order.paymentReference) return true; // pre-journal legacy order
+	const payment = await (
+		ctx.storage as unknown as {
+			payments: StorageCollection<PaymentRecord>;
+		}
+	).payments.get(order.id);
+	return payment?.status === "finalized";
+}
+
 async function handlePaymentIntentSucceeded(
 	ctx: PluginContext,
 	pi: StripePaymentIntent,
@@ -117,7 +133,7 @@ async function handlePaymentIntentSucceeded(
 	// ran, it created the order — the next check catches that too.
 	if (pi.metadata?.checkoutMode === "hosted") {
 		const existing = await findOrderByPaymentIntent(ctx, pi.id);
-		if (existing) {
+		if (await settledOrder(ctx, existing)) {
 			return new Response(JSON.stringify({ received: true, duplicate: true }), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
@@ -131,7 +147,7 @@ async function handlePaymentIntentSucceeded(
 
 	// Idempotent: return on duplicate
 	const existing = await findOrderByPaymentIntent(ctx, pi.id);
-	if (existing) {
+	if (await settledOrder(ctx, existing)) {
 		return new Response(JSON.stringify({ received: true, duplicate: true }), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
@@ -156,18 +172,6 @@ async function handlePaymentIntentSucceeded(
 
 	if (!duplicate) {
 		await ctx.kv.delete(draftKey(orderDraftId));
-		// Cart is fulfilled — wipe it so the buyer's next page load
-		// gets a fresh empty cart keyed by the same session cookie.
-		// Safe under webhook retries because the `duplicate` short-circuit
-		// above guards against re-entry on the same PI.
-		try {
-			await clearCart(ctx, cart.sessionId);
-		} catch (err) {
-			ctx.log.warn("Failed to clear cart after order", {
-				sessionId: cart.sessionId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
 	}
 
 	return new Response(
@@ -352,6 +356,10 @@ async function handleCheckoutSessionCompleted(
 		);
 	}
 
+	// A completed Checkout session can still be awaiting an asynchronous payment.
+	if (session.payment_status !== "paid") {
+		return new Response(JSON.stringify({ received: true, awaitingPayment: true }), { status: 200 });
+	}
 	if (!session.payment_intent) {
 		ctx.log.warn("checkout.session.completed has no payment_intent", {
 			sessionId: session.id,
@@ -364,7 +372,12 @@ async function handleCheckoutSessionCompleted(
 
 	// Idempotent on PI (same guard as payment_intent.succeeded).
 	const existing = await findOrderByPaymentIntent(ctx, session.payment_intent);
-	if (existing) {
+	if (await settledOrder(ctx, existing)) {
+		const remaining = await ctx.kv.get<CheckoutDraftSnapshot>(draftKey(orderDraftId));
+		if (remaining && existing?.paymentReference) {
+			await clearPurchasedCart(ctx, remaining.cart);
+			await ctx.kv.delete(draftKey(orderDraftId));
+		}
 		return new Response(JSON.stringify({ received: true, duplicate: true }), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
@@ -438,6 +451,33 @@ async function handleCheckoutSessionCompleted(
 		});
 	}
 	const pi = await retrievePaymentIntent(ctx, session.payment_intent, client);
+	const quote = snapshot.cart;
+	const base = quote.subtotal.amount - quote.discountTotal.amount + quote.shippingTotal.amount;
+	const tax = session.automatic_tax?.enabled
+		? session.total_details?.amount_tax
+		: quote.taxTotal.amount;
+	if (
+		!Number.isSafeInteger(base) ||
+		base < 0 ||
+		!Number.isSafeInteger(tax) ||
+		(tax as number) < 0 ||
+		(session.automatic_tax?.enabled &&
+			(session.automatic_tax.status !== "complete" || quote.taxTotal.amount !== 0)) ||
+		quote.total.amount !== base + quote.taxTotal.amount ||
+		!Number.isSafeInteger(session.amount_total) ||
+		session.amount_total !== base + tax! ||
+		session.currency?.toUpperCase() !== quote.currency ||
+		pi.currency.toUpperCase() !== quote.currency ||
+		pi.status !== "succeeded" ||
+		pi.amount_received !== session.amount_total
+	)
+		throw new Error("Stripe session tax/total does not match purchased quote and payment");
+	if (session.automatic_tax?.enabled) {
+		cart.taxTotal = { amount: tax!, currency: quote.currency };
+		cart.total = { amount: session.amount_total!, currency: quote.currency };
+		// Stripe supplies an aggregate here, not a jurisdiction/rate breakdown.
+		cart.taxLines = [{ label: "Stripe Tax", amount: cart.taxTotal }];
+	}
 
 	const { order, duplicate } = await createOrderFromPaymentIntent(ctx, {
 		paymentIntent: pi,
@@ -445,17 +485,10 @@ async function handleCheckoutSessionCompleted(
 		orderDraftId,
 	});
 
-	if (!duplicate) {
-		await ctx.kv.delete(draftKey(orderDraftId));
-		try {
-			await clearCart(ctx, cart.sessionId);
-		} catch (err) {
-			ctx.log.warn("Failed to clear cart after hosted checkout", {
-				sessionId: cart.sessionId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-	}
+	// Stripe's collected contact may differ from the original saved cart.
+	// Compare against the pre-redirect cart, never blindly delete a newer one.
+	await clearPurchasedCart(ctx, snapshot.cart);
+	if (!duplicate) await ctx.kv.delete(draftKey(orderDraftId));
 
 	return new Response(
 		JSON.stringify({
@@ -467,16 +500,33 @@ async function handleCheckoutSessionCompleted(
 	);
 }
 
+async function releaseFailedStripeDraft(ctx: PluginContext, orderDraftId: string) {
+	const snapshot = await ctx.kv.getVersioned<CheckoutDraftSnapshot>(draftKey(orderDraftId));
+	const lock = await getLock(ctx, orderDraftId);
+	if (lock) await deleteLock(ctx, orderDraftId);
+	if (snapshot) {
+		await releaseCouponClaims(
+			ctx,
+			orderDraftId,
+			snapshot.value.cart,
+			snapshot.value.mode ?? "test",
+		);
+		// Preserve the purchase snapshot: a previously failed PI can later
+		// succeed, and that later authenticated success must remain recoverable.
+		await ctx.kv.compareAndSet(draftKey(orderDraftId), snapshot.revision, {
+			...snapshot.value,
+			failed: true,
+		});
+	}
+}
+
 /** `checkout.session.async_payment_failed` / `checkout.session.expired` */
 async function handleCheckoutSessionTerminated(
 	ctx: PluginContext,
 	session: StripeCheckoutSession,
 ): Promise<Response> {
 	const orderDraftId = session.metadata?.orderDraftId;
-	if (orderDraftId) {
-		const lock = await getLock(ctx, orderDraftId);
-		if (lock) await deleteLock(ctx, orderDraftId);
-	}
+	if (orderDraftId) await releaseFailedStripeDraft(ctx, orderDraftId);
 	return new Response(JSON.stringify({ received: true }), {
 		status: 200,
 		headers: { "Content-Type": "application/json" },
@@ -488,10 +538,10 @@ async function handlePaymentIntentFailure(
 	pi: StripePaymentIntent,
 ): Promise<Response> {
 	const orderDraftId = pi.metadata?.orderDraftId;
-	if (orderDraftId) {
-		const lock = await getLock(ctx, orderDraftId);
-		if (lock) await deleteLock(ctx, orderDraftId);
-	}
+	// A card decline usually leaves the PI retryable (requires_payment_method).
+	// Only cancellation is terminal: retain its stock/coupon hold for a normal
+	// retry with another card, or until the bounded reservation expires.
+	if (orderDraftId && pi.status === "canceled") await releaseFailedStripeDraft(ctx, orderDraftId);
 	return new Response(JSON.stringify({ received: true }), {
 		status: 200,
 		headers: { "Content-Type": "application/json" },
@@ -517,10 +567,16 @@ async function handleChargeRefunded(ctx: PluginContext, charge: StripeCharge): P
 			chargeId: charge.id,
 			piId: charge.payment_intent,
 		});
-		return new Response(JSON.stringify({ received: true, orphan: true }), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
+		return new Response(
+			JSON.stringify({
+				retryable: true,
+				error: "Order not finalized yet; retry refund notification",
+			}),
+			{
+				status: 503,
+				headers: { "Content-Type": "application/json" },
+			},
+		);
 	}
 	const refunds = charge.refunds?.data ?? [];
 	for (const r of refunds) {
@@ -551,36 +607,124 @@ export const webhookRoutes = {
 		handler: async (routeCtx: RouteContext, _ctx?: PluginContext) => {
 			const ctx = (_ctx ?? (routeCtx as unknown as PluginContext)) as PluginContext;
 			try {
-				const key = await ctx.kv.get<string>("settings:paystackSecretKey");
-				testKey(key);
 				const payload =
 					routeCtx.input instanceof Uint8Array
 						? routeCtx.input
 						: new Uint8Array(await routeCtx.request.arrayBuffer());
-				await verifySignature(payload, routeCtx.request.headers.get("x-paystack-signature"), key);
-				let event: { event?: string; data?: { reference?: string } };
+				let event: { event?: string; data?: { reference?: string; id?: number | string } };
 				try {
 					event = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
 				} catch {
 					throw new PaymentProviderError("Invalid webhook JSON");
 				}
-				if (event.event !== "charge.success" || typeof event.data?.reference !== "string")
+				if (event.event !== "charge.success") {
+					// Authenticate every notification. A known refund must use its persisted
+					// mode, not whichever merchant key currently wins the selector.
+					const refundEvent = typeof event.event === "string" && event.event.startsWith("refund.");
+					const id = event.data?.id;
+					const refundId =
+						(typeof id === "number" || typeof id === "string") &&
+						/^[1-9][0-9]*$/.test(String(id)) &&
+						Number.isSafeInteger(Number(id))
+							? String(id)
+							: null;
+					const store = (ctx.storage as unknown as { refunds: StorageCollection<Refund> }).refunds;
+					const matches: Refund[] = [];
+					if (refundEvent && refundId)
+						for (const mode of ["test", "live"] as const) {
+							const row = (
+								await store.query({
+									where: { providerRefundKey: `paystack:${mode}:${refundId}` },
+									limit: 2,
+								})
+							).items;
+							matches.push(...row.map((r) => ({ ...r.data, id: r.id })));
+						}
+					const known = matches.length === 1 ? matches[0] : null;
+					const modes =
+						known?.paymentMode === "test" || known?.paymentMode === "live"
+							? [known.paymentMode]
+							: (["test", "live"] as const);
+					let authenticatedMode: "test" | "live" | undefined;
+					for (const mode of modes) {
+						try {
+							const secret = await resolvePaystackKey(ctx, mode);
+							await verifySignature(
+								payload,
+								routeCtx.request.headers.get("x-paystack-signature"),
+								secret,
+								mode,
+							);
+							authenticatedMode = mode;
+							break;
+						} catch (err) {
+							if (!(err instanceof PaymentProviderError)) throw err;
+						}
+					}
+					if (!authenticatedMode)
+						throw new PaymentProviderError("Invalid Paystack signature", { status: 400 });
+					if (refundEvent) {
+						if (
+							!refundId ||
+							matches.length > 1 ||
+							(known &&
+								(known.paymentProvider !== "paystack" || known.providerRefundId !== refundId))
+						) {
+							ctx.log.error("Paystack refund requires operator reconciliation", {
+								providerRefundId: refundId,
+							});
+							return Response.json({ received: true, reconciliationRequired: true });
+						}
+						const response = await retrievePaystackRefund(
+							ctx,
+							await resolvePaystackKey(ctx, authenticatedMode),
+							Number(refundId),
+							authenticatedMode,
+						);
+						const result = await syncPaystackRefund(ctx, response, authenticatedMode);
+						if (result.reconciliationRequired)
+							ctx.log.error("Paystack refund requires operator reconciliation", {
+								providerRefundId: refundId,
+							});
+						return Response.json({
+							received: true,
+							...(result.refund
+								? { refundId: result.refund.id, status: result.refund.status }
+								: result),
+						});
+					}
 					return new Response(JSON.stringify({ received: true, ignored: true }), { status: 200 });
+				}
+				if (typeof event.data?.reference !== "string")
+					throw new PaymentProviderError("Missing payment reference", { status: 400 });
 				const attempt = await attemptForReference(ctx, event.data.reference);
 				if (!attempt) throw new PaymentProviderError("Unknown payment reference", { status: 400 });
+				const mode = attemptMode(attempt);
+				const key = await resolvePaystackKey(ctx, attempt);
+				await verifySignature(
+					payload,
+					routeCtx.request.headers.get("x-paystack-signature"),
+					key,
+					mode,
+				);
 				const current = await reconcileAttempt(ctx, key, attempt);
 				if (current.outcome !== "verified")
 					throw new PaymentProviderError(`Payment ${current.outcome ?? "pending"}`, {
 						status: 409,
 					});
-				const { order, duplicate } = await finalizePaystackTest(ctx, current);
+				const { order, duplicate } = await finalizePaystack(ctx, current);
 				return new Response(
-					JSON.stringify({ received: true, orderId: order.id, duplicate, testMode: true }),
+					JSON.stringify({
+						received: true,
+						orderId: order.id,
+						duplicate,
+						testMode: mode === "test",
+					}),
 					{ status: 200 },
 				);
 			} catch (err) {
 				if (err instanceof PaymentProviderError) {
-					ctx.log.warn("Paystack test webhook rejected", {
+					ctx.log.warn("Paystack webhook rejected", {
 						code: err.code,
 						error: err.message,
 					});
@@ -650,7 +794,22 @@ export const webhookRoutes = {
 			// (stripePaymentIntentId, stripeRefundId, …) still protects
 			// against out-of-order deliveries for different events against
 			// the same resource.
-			if (event.id) {
+			// Shared ordinary payment/refund effects have their own durable CAS
+			// markers. A pre-handler event claim would permanently eat a retry
+			// after an interrupted finalization. Keep legacy preclaim for unrelated
+			// subscription/Connect notifications until they gain their own journal.
+			const recoverable = [
+				"payment_intent.succeeded",
+				"payment_intent.payment_failed",
+				"payment_intent.canceled",
+				"checkout.session.expired",
+				"checkout.session.async_payment_failed",
+				"checkout.session.completed",
+				"checkout.session.async_payment_succeeded",
+				"charge.refunded",
+				"refund.updated",
+			];
+			if (event.id && !recoverable.includes(event.type)) {
 				const fresh = await recordStripeEvent(ctx, event.id, event.type);
 				if (!fresh) {
 					return new Response(JSON.stringify({ received: true, duplicate: true }), {
@@ -671,6 +830,7 @@ export const webhookRoutes = {
 					case "payment_intent.canceled":
 						return await handlePaymentIntentFailure(ctx, event.data.object as StripePaymentIntent);
 					case "checkout.session.completed":
+					case "checkout.session.async_payment_succeeded":
 						return await handleCheckoutSessionCompleted(
 							ctx,
 							event.data.object as StripeCheckoutSession,
@@ -683,6 +843,37 @@ export const webhookRoutes = {
 						);
 					case "charge.refunded":
 						return await handleChargeRefunded(ctx, event.data.object as StripeCharge);
+					case "refund.updated": {
+						const refund = event.data.object as StripeRefund;
+						let order = refund.payment_intent
+							? await findOrderByPaymentIntent(ctx, refund.payment_intent)
+							: null;
+						if (!order && refund.charge) {
+							const chargeOrder = (
+								await (ctx.storage as unknown as { orders: StorageCollection<Order> }).orders.query(
+									{ where: { stripeChargeId: refund.charge }, limit: 1 },
+								)
+							).items[0];
+							if (chargeOrder) order = { ...chargeOrder.data, id: chargeOrder.id };
+						}
+						if (!order) {
+							const row = (
+								await (
+									ctx.storage as unknown as { refunds: StorageCollection<Refund> }
+								).refunds.query({ where: { stripeRefundId: refund.id }, limit: 1 })
+							).items[0];
+							if (row) {
+								const stored = await (
+									ctx.storage as unknown as { orders: StorageCollection<Order> }
+								).orders.get(row.data.orderId);
+								if (stored) order = { ...stored, id: row.data.orderId };
+							}
+						}
+						if (!order)
+							throw new Error("Refund order is not available yet; retry this notification");
+						await recordRefundFromWebhook(ctx, order, refund);
+						return new Response(JSON.stringify({ received: true }), { status: 200 });
+					}
 					case "customer.subscription.created":
 					case "customer.subscription.updated":
 					case "customer.subscription.resumed":
@@ -795,6 +986,12 @@ export const webhookRoutes = {
 			}
 		},
 	},
+};
+
+/** Normal gateway endpoint; legacy checkout/paystack-webhook remains a compatible alias.
+ * Lead should spread this registry into the public routes alongside webhookRoutes. */
+export const paystackWebhookRoutes = {
+	"checkout/paystack": webhookRoutes["checkout/paystack-webhook"],
 };
 
 /**

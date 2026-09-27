@@ -50,13 +50,17 @@ const fixtureFetch = async (input, init) => {
 		assert.equal(body.currency, "ZAR");
 		assert.equal(typeof body.reference, "string");
 		assert.equal(typeof body.email, "string");
-		assert(["127.0.0.1", "localhost"].includes(new URL(body.callback_url).hostname));
+		const callback = new URL(body.callback_url);
+		if (state.mode === "live") {
+			assert.equal(callback.origin, "https://shop.example.invalid");
+		} else assert(["127.0.0.1", "localhost"].includes(callback.hostname));
 		if (state.transactions[body.reference]) {
 			save(state);
 			return json({ status: false, message: "Duplicate Transaction Reference" }, 400);
 		}
 		state.transactions[body.reference] = {
 			...body,
+			id: Object.keys(state.transactions).length + 12345,
 			metadata: typeof body.metadata === "string" ? JSON.parse(body.metadata) : body.metadata,
 		};
 		const loseResponse = state.loseInitializeResponseOnce;
@@ -82,11 +86,11 @@ const fixtureFetch = async (input, init) => {
 			status: true,
 			message: "Fixture verified",
 			data: {
-				id: 12345,
+				id: tx.id ?? 12345,
 				reference,
 				amount: tx.amount,
 				currency: tx.currency,
-				domain: "test",
+				domain: state.mode ?? "test",
 				status: state.status ?? "success",
 				paid_at: new Date().toISOString(),
 				customer: { email: tx.email },
@@ -94,6 +98,50 @@ const fixtureFetch = async (input, init) => {
 				...(state.verificationOverrides ?? {}),
 			},
 		});
+	}
+	if (url.pathname === "/refund" && request.method === "POST") {
+		const body = await request.json();
+		const tx = state.transactions[body.transaction];
+		assert(tx, "Refund must reference an initialized fixture transaction");
+		assert(Number.isSafeInteger(body.amount) && body.amount > 0 && body.amount <= tx.amount);
+		assert.equal(body.currency, tx.currency);
+		state.refunds ??= {};
+		const prior = Object.values(state.refunds)
+			.filter(
+				(refund) => refund.transaction.reference === body.transaction && refund.status !== "failed",
+			)
+			.reduce((sum, refund) => sum + refund.amount, 0);
+		assert(prior + body.amount <= tx.amount, "Provider fixture detected over-refund");
+		const id = Object.keys(state.refunds).length + 1000;
+		const data = {
+			id,
+			amount: body.amount,
+			currency: body.currency,
+			domain: state.mode ?? "test",
+			status: state.refundStatus ?? "pending",
+			transaction: {
+				id: tx.id,
+				reference: body.transaction,
+				domain: state.mode ?? "test",
+				currency: tx.currency,
+			},
+		};
+		state.refunds[id] = data;
+		const lose = state.loseRefundResponseOnce;
+		delete state.loseRefundResponseOnce;
+		save(state);
+		if (lose) throw new Error("Fixture refund response lost");
+		return json({ status: true, data });
+	}
+	if (/^\/refund\/\d+$/.test(url.pathname) && request.method === "GET") {
+		const data = state.refunds?.[url.pathname.split("/").at(-1)];
+		if (!data) {
+			save(state);
+			return json({ status: false, message: "Fixture refund not found" }, 404);
+		}
+		data.status = state.refundStatus ?? data.status;
+		save(state);
+		return json({ status: true, data });
 	}
 	throw new Error(`Unexpected fixture provider endpoint: ${request.method} ${url.pathname}`);
 };

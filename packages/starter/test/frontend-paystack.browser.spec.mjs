@@ -121,8 +121,9 @@ test.beforeAll(async () => {
 	siteSetting.run("emdash:site_url", JSON.stringify(origin), randomUUID());
 	setSetting("settings:defaultCurrency", "ZAR");
 	setSetting("settings:enabledCurrencies", ["ZAR"]);
-	setSetting("settings:paymentProvider", "paystack-test");
-	setSetting("settings:paystackSecretKey", environment.DASHCOMMERCE_FIXTURE_KEY);
+	setSetting("settings:paymentProvider", "paystack");
+	setSetting("settings:paystackMode", "test");
+	setSetting("settings:paystackTestSecretKey", environment.DASHCOMMERCE_FIXTURE_KEY);
 	setSetting("settings:taxMode", "flat");
 	setSetting("settings:flatTaxRatePercent", 0);
 	const document = database.prepare(
@@ -289,7 +290,7 @@ test("personalises a line and completes the real backend Paystack TEST browser r
 	expect(
 		database
 			.prepare(
-				"SELECT count(*) AS count FROM options WHERE name LIKE 'plugin:dashcommerce:receipt-preview:%'",
+				"SELECT count(*) AS count FROM _plugin_storage WHERE collection='commerce_outbox' AND json_extract(data, '$.status')='suppressed'",
 			)
 			.get().count,
 	).toBe(1);

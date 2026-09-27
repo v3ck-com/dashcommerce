@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -21,7 +21,14 @@ export const address = {
 };
 
 /** Real built application; all data, keys, and provider responses are synthetic. */
-export async function startFixture({ stock = 2, providerStatus = "success" } = {}) {
+export async function startFixture({
+	stock = 2,
+	providerStatus = "success",
+	provider = "paystack-test",
+	mode = "test",
+	admin = false,
+	product = {},
+} = {}) {
 	const temporary = await mkdtemp(resolve(tmpdir(), "dashcommerce-http-"));
 	let child;
 	let db;
@@ -48,11 +55,12 @@ export async function startFixture({ stock = 2, providerStatus = "success" } = {
 		const port = listener.address().port;
 		await new Promise((done) => listener.close(done));
 		const origin = `http://127.0.0.1:${port}`;
-		const key = `sk_test_${randomBytes(20).toString("hex")}`;
+		const canonical = mode === "live" ? "https://shop.example.invalid" : origin;
+		const key = `sk_${mode}_${randomBytes(20).toString("hex")}`;
 		const providerPath = resolve(temporary, "provider.json");
 		await writeFile(
 			providerPath,
-			JSON.stringify({ transactions: {}, status: providerStatus, calls: [] }),
+			JSON.stringify({ transactions: {}, refunds: {}, status: providerStatus, mode, calls: [] }),
 		);
 		const env = {
 			PATH: process.env.PATH,
@@ -60,8 +68,8 @@ export async function startFixture({ stock = 2, providerStatus = "success" } = {
 			NODE_ENV: "production",
 			HOST: "127.0.0.1",
 			PORT: String(port),
-			SITE_URL: origin,
-			EMDASH_SITE_URL: origin,
+			SITE_URL: canonical,
+			EMDASH_SITE_URL: canonical,
 			EMDASH_ENCRYPTION_KEY: `emdash_enc_v1_${randomBytes(32).toString("base64url")}`,
 			DASHCOMMERCE_NETWORK_FIXTURE: "1",
 			DASHCOMMERCE_PROVIDER_FIXTURE: providerPath,
@@ -102,6 +110,7 @@ export async function startFixture({ stock = 2, providerStatus = "success" } = {
 								customisation_definition: {
 									fields: [{ key: "name", required: true, maxLength: 30 }],
 								},
+								...product,
 							},
 						},
 					],
@@ -126,18 +135,33 @@ export async function startFixture({ stock = 2, providerStatus = "success" } = {
 			"INSERT INTO options (name,value,revision) VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value, revision=excluded.revision",
 		);
 		const setOption = (name, value) => option.run(name, JSON.stringify(value), randomUUID());
-		setOption("emdash:site_url", origin);
+		setOption("emdash:site_url", canonical);
 		setOption("emdash:setup_complete", true);
-		// No login or authentication bypass: a disabled synthetic owner only
-		// prevents public pages redirecting to the first-owner setup wizard.
+		// Real native bearer authentication when requested; no auth bypass route.
+		const owner = randomUUID();
 		db.prepare(
 			"INSERT INTO users (id,email,name,role,email_verified,disabled) VALUES (?,?,?,?,?,?)",
-		).run(randomUUID(), "owner@example.invalid", "Disabled fixture owner", 50, 0, 1);
+		).run(owner, "owner@example.invalid", "Synthetic fixture owner", 50, 0, admin ? 0 : 1);
+		const adminToken = `ec_pat_${randomBytes(32).toString("base64url")}`;
+		if (admin)
+			db.prepare(
+				"INSERT INTO _emdash_api_tokens (id,name,token_hash,prefix,user_id,scopes,expires_at) VALUES (?,?,?,?,?,?,?)",
+			).run(
+				randomUUID(),
+				"Disposable fixture token",
+				createHash("sha256").update(adminToken).digest("base64url"),
+				adminToken.slice(0, 10),
+				owner,
+				JSON.stringify(["admin"]),
+				new Date(Date.now() + 600000).toISOString(),
+			);
 		const set = (keyName, value) => setOption(`plugin:dashcommerce:${keyName}`, value);
 		set("settings:defaultCurrency", "ZAR");
 		set("settings:enabledCurrencies", ["ZAR"]);
-		set("settings:paymentProvider", "paystack-test");
-		set("settings:paystackSecretKey", key);
+		set("settings:paymentProvider", provider);
+		set("settings:paystackMode", mode);
+		set(mode === "live" ? "settings:paystackLiveSecretKey" : "settings:paystackTestSecretKey", key);
+		if (mode === "test") set("settings:paystackSecretKey", key);
 		set("settings:checkoutMode", "hosted");
 		set("settings:taxMode", "flat");
 		set("settings:flatTaxRatePercent", 0);
@@ -210,6 +234,20 @@ export async function startFixture({ stock = 2, providerStatus = "success" } = {
 				.map((row) => ({ ...JSON.parse(row.data), id: row.id }));
 		return {
 			origin,
+			providerId: provider,
+			mode,
+			adminRequest: (route, init = {}) => {
+				assert(admin, "Fixture administrator was not enabled");
+				return fetch(endpoint(route), {
+					...init,
+					headers: {
+						origin,
+						"content-type": "application/json",
+						...init.headers,
+						authorization: `Bearer ${adminToken}`,
+					},
+				});
+			},
 			endpoint,
 			productId,
 			cookie,

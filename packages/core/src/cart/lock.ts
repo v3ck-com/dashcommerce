@@ -10,8 +10,10 @@ import type { PluginContext } from "emdash";
 import type { StockLock } from "../types";
 import {
 	InventoryError,
+	type InventoryMode,
 	releaseInventoryReservation,
 	reserveInventory,
+	resolveInventoryMode,
 	sumReservedInventory,
 } from "../inventory/reservations";
 
@@ -27,13 +29,14 @@ export function newLock(
 	orderDraftId: string,
 	sessionId: string,
 	entries: StockLock["entries"],
-	opts: { ttlMs?: number; stripePaymentIntentId?: string } = {},
+	opts: { ttlMs?: number; stripePaymentIntentId?: string; mode?: InventoryMode } = {},
 ): StockLock {
 	const now = Date.now();
 	const ttl = opts.ttlMs ?? DEFAULT_TTL_MS;
 	return {
 		orderDraftId,
 		sessionId,
+		...(opts.mode !== undefined ? { mode: opts.mode } : {}),
 		...(opts.stripePaymentIntentId ? { stripePaymentIntentId: opts.stripePaymentIntentId } : {}),
 		entries,
 		expiresAt: new Date(now + ttl).toISOString(),
@@ -47,8 +50,13 @@ export function newLock(
  * recoverable reservation and never an unprotected stock mutation.
  */
 export async function createLock(ctx: PluginContext, lock: StockLock): Promise<void> {
+	const prior = await getLock(ctx, lock.orderDraftId);
+	const mode = prior ? (prior.mode ?? "test") : await resolveInventoryMode(ctx, lock.mode);
+	if (lock.mode !== undefined && lock.mode !== mode) throw new Error("Stock lock mode conflict");
+	// Capture once, including on retries after settings have changed.
+	lock = { ...lock, mode };
 	const ttlMs = Date.parse(lock.expiresAt) - Date.now();
-	await reserveInventory(ctx, lock.orderDraftId, lock.entries, { ttlMs });
+	await reserveInventory(ctx, lock.orderDraftId, lock.entries, { ttlMs, mode });
 	if (typeof ctx.kv.getVersioned !== "function" || typeof ctx.kv.compareAndSet !== "function") {
 		throw new Error("EmDash conditional KV is required for stock locks");
 	}
@@ -57,7 +65,11 @@ export async function createLock(ctx: PluginContext, lock: StockLock): Promise<v
 		if (current) {
 			// Repeated checkout calls with the same draft are harmless. Do not
 			// overwrite a different record after a read/modify/write race.
-			if (current.value.orderDraftId === lock.orderDraftId) return;
+			if (
+				current.value.orderDraftId === lock.orderDraftId &&
+				(current.value.mode ?? "test") === mode
+			)
+				return;
 			throw new Error("Stock lock key collision");
 		}
 		const write = await ctx.kv.compareAndSet(lockKey(lock.orderDraftId), null, lock);
@@ -72,9 +84,13 @@ export async function getLock(ctx: PluginContext, orderDraftId: string): Promise
 	return (await ctx.kv.get<StockLock>(lockKey(orderDraftId))) ?? null;
 }
 
-async function releaseReservationForLock(ctx: PluginContext, orderDraftId: string) {
+async function releaseReservationForLock(
+	ctx: PluginContext,
+	orderDraftId: string,
+	mode: InventoryMode = "test",
+) {
 	try {
-		return await releaseInventoryReservation(ctx, orderDraftId);
+		return await releaseInventoryReservation(ctx, orderDraftId, mode);
 	} catch (error) {
 		// A successful payment may leave its legacy link for observability. Its
 		// consumed reservation must remain immutable, but the stale link may be
@@ -86,16 +102,24 @@ async function releaseReservationForLock(ctx: PluginContext, orderDraftId: strin
 
 /** Conditional delete prevents an expiry/cleanup worker deleting a newer link. */
 export async function deleteLock(ctx: PluginContext, orderDraftId: string): Promise<void> {
-	// Legacy callers use deleteLock for failed/cancelled payments. Releasing
-	// first is safe on retries and leaves consumed reservations immutable.
-	await releaseReservationForLock(ctx, orderDraftId);
+	await releaseAndDeleteLock(ctx, orderDraftId);
+}
+
+async function releaseAndDeleteLock(ctx: PluginContext, orderDraftId: string): Promise<boolean> {
+	// Read the durable environment once before releasing; never consult settings.
 	const existing =
 		typeof ctx.kv.getVersioned === "function"
 			? await ctx.kv.getVersioned<StockLock>(lockKey(orderDraftId))
 			: null;
+	const released = await releaseReservationForLock(
+		ctx,
+		orderDraftId,
+		existing?.value.mode ?? "test",
+	);
 	if (existing && typeof ctx.kv.compareAndDelete === "function") {
 		await ctx.kv.compareAndDelete(lockKey(orderDraftId), existing.revision);
 	}
+	return Boolean(existing || released);
 }
 
 /** List is informational only; it is not used to decide stock availability. */
@@ -113,16 +137,14 @@ export async function sumActiveLocksForProduct(
 	ctx: PluginContext,
 	productId: string,
 	variantId?: string,
+	mode?: InventoryMode,
 ): Promise<number> {
-	return sumReservedInventory(ctx, productId, variantId);
+	return sumReservedInventory(ctx, productId, variantId, mode);
 }
 
 /** Release is idempotent and cannot mutate a consumed reservation. */
 export async function releaseLock(ctx: PluginContext, orderDraftId: string): Promise<boolean> {
-	const existing = await getLock(ctx, orderDraftId);
-	const released = await releaseReservationForLock(ctx, orderDraftId);
-	await deleteLock(ctx, orderDraftId);
-	return Boolean(existing || released);
+	return releaseAndDeleteLock(ctx, orderDraftId);
 }
 
 /**
@@ -136,13 +158,18 @@ export async function sweepExpiredLocks(ctx: PluginContext): Promise<number> {
 	for (const row of rows) {
 		const lock = row.value as StockLock | null;
 		if (!lock || Date.parse(lock.expiresAt) > now) continue;
-		// Release is a CAS transition; it is not a blind expiry delete.
-		await releaseReservationForLock(ctx, lock.orderDraftId);
 		const versioned =
 			typeof ctx.kv.getVersioned === "function"
 				? await ctx.kv.getVersioned<StockLock>(row.key)
 				: null;
-		if (versioned && typeof ctx.kv.compareAndDelete === "function") {
+		if (!versioned || Date.parse(versioned.value.expiresAt) > now) continue;
+		// Release the same version's environment that will be conditionally deleted.
+		await releaseReservationForLock(
+			ctx,
+			versioned.value.orderDraftId,
+			versioned.value.mode ?? "test",
+		);
+		if (typeof ctx.kv.compareAndDelete === "function") {
 			const deleted = await ctx.kv.compareAndDelete(row.key, versioned.revision);
 			if (deleted.applied) swept++;
 		}

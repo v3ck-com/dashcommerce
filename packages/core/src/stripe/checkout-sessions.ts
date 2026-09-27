@@ -108,6 +108,8 @@ export interface StripeCheckoutSession {
 	metadata?: Record<string, string>;
 	amount_total?: number;
 	currency?: string;
+	automatic_tax?: { enabled?: boolean; status?: string };
+	total_details?: { amount_tax?: number };
 	customer_details?: {
 		email?: string;
 		name?: string;
@@ -165,7 +167,8 @@ export async function createCheckoutSession(
 		}
 		if (li.recurring) {
 			params[`line_items[${i}][price_data][recurring][interval]`] = li.recurring.interval;
-			params[`line_items[${i}][price_data][recurring][interval_count]`] = li.recurring.intervalCount;
+			params[`line_items[${i}][price_data][recurring][interval_count]`] =
+				li.recurring.intervalCount;
 		}
 		if (li.taxBehavior) {
 			params[`line_items[${i}][price_data][tax_behavior]`] = li.taxBehavior;

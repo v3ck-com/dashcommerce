@@ -29,12 +29,20 @@
  */
 
 import type { PluginContext, RouteContext } from "emdash";
-import { randomId } from "../util/ids";
-import { isObject, validAddress, validContactInput } from "../cart/validation";
-import { getCart, getOrCreate, save, switchCurrency } from "../cart/store";
-import { recalculate, type PricingPolicy } from "../cart/calculate";
 import { verifyRestoreToken } from "../abandoned-cart/recover";
+import { type PricingPolicy, recalculate } from "../cart/calculate";
+import {
+	CUSTOMISATION_FIELD_SLUG,
+	customisationIdentity,
+	validateCustomisation,
+} from "../cart/customisation";
+import { getCart, getOrCreate, save, switchCurrency } from "../cart/store";
+import { isObject, validAddress, validContactInput } from "../cart/validation";
 import { resolveDiscount, validateCoupon } from "../coupons/validate";
+import { MAX_INVENTORY_QUANTITY } from "../inventory/reservations";
+import { normalizeProductFields } from "../products/normalize";
+import { resolvePrice } from "../products/pricing";
+import { getVariant, listVariantsForProduct } from "../products/variants";
 import { calculateRates } from "../shipping/calculate";
 import { pickZone } from "../shipping/calculate";
 import type {
@@ -45,15 +53,7 @@ import type {
 	ShippingMethod,
 	ShippingZone,
 } from "../types";
-import { resolvePrice } from "../products/pricing";
-import { normalizeProductFields } from "../products/normalize";
-import {
-	CUSTOMISATION_FIELD_SLUG,
-	customisationIdentity,
-	validateCustomisation,
-} from "../cart/customisation";
-import { MAX_INVENTORY_QUANTITY } from "../inventory/reservations";
-import { getVariant, listVariantsForProduct } from "../products/variants";
+import { randomId } from "../util/ids";
 
 // Cart routes must return HTTP 4xx on failure — returning a plain
 // `{ error }` object gets serialized as `{ status: 200, body: { error } }`
@@ -95,7 +95,7 @@ const SID_COOKIE = "dashcommerce_sid";
 export function resolveSessionId(req: Request): { sessionId: string; setCookie?: string } {
 	const cookie = req.headers.get("cookie") ?? "";
 	const match = cookie.match(new RegExp(`(?:^|; )${SID_COOKIE}=([^;]+)`));
-	if (match && match[1]) return { sessionId: decodeURIComponent(match[1]) };
+	if (match?.[1]) return { sessionId: decodeURIComponent(match[1]) };
 	const sessionId = randomId();
 	return {
 		sessionId,
@@ -244,7 +244,8 @@ export const cartRoutes = {
 			// Normalize into our camelCase ProductFields shape before any
 			// downstream read.
 			const fields = normalizeProductFields(product.data as Record<string, unknown>);
-			const priced = resolvePrice({ product: fields, currency: cart.currency });
+			const variant = body.variantId ? await getVariant(ctx, body.variantId) : null;
+			const priced = resolvePrice({ product: fields, variant, currency: cart.currency });
 			if (!priced) {
 				const available = Object.keys(fields.prices ?? {});
 				const enabled = (await ctx.kv.get<string[]>("settings:enabledCurrencies")) ?? [];
@@ -269,6 +270,7 @@ export const cartRoutes = {
 				(product.data as Record<string, unknown>)[CUSTOMISATION_FIELD_SLUG],
 				body.customisation,
 			);
+			const weightGrams = variant?.weightGrams ?? fields.weightGrams;
 			if (!customisation.ok) return errorResponse(customisation.error, 400, setCookie);
 
 			// Merge only lines with the same product, variant AND canonical options.
@@ -320,7 +322,8 @@ export const cartRoutes = {
 					...(fields.shippingClassSlug !== null
 						? { shippingClassSlug: fields.shippingClassSlug }
 						: {}),
-					...(fields.weightGrams !== null ? { weightGrams: fields.weightGrams } : {}),
+					taxClass: fields.taxClass,
+					...(weightGrams !== null ? { weightGrams } : {}),
 				};
 				items = [...cart.items, newItem];
 			}

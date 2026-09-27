@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { matchesZone, pickZone } from "../src/shipping/calculate";
+import { money } from "../src/money";
+import { calculateRates, matchesZone, pickZone } from "../src/shipping/calculate";
 import type { Address, ShippingZone } from "../src/types";
 
 function zone(
@@ -76,6 +77,112 @@ describe("shipping zone matching", () => {
 	it("returns null when no zone matches", () => {
 		const zones = [zone("canada", [{ country: "CA" }])];
 		expect(pickZone(address("US", "NY"), zones)).toBeNull();
+	});
+
+	it("keeps configured flat, free, pickup and weight methods available", () => {
+		const items = [
+			{
+				lineId: "line",
+				productId: "p",
+				quantity: 2,
+				unitPrice: money("USD", 1000),
+				lineSubtotal: money("USD", 2000),
+				title: "Widget",
+				isDigital: false,
+				weightGrams: 500,
+			},
+		];
+		const options = calculateRates({
+			items,
+			currency: "USD",
+			methods: [
+				{
+					id: "flat",
+					zoneId: "z",
+					type: "flat_rate",
+					title: "Flat",
+					enabled: true,
+					order: 0,
+					config: { type: "flat_rate", amount: money("USD", 300) },
+				},
+				{
+					id: "free",
+					zoneId: "z",
+					type: "free_shipping",
+					title: "Free",
+					enabled: true,
+					order: 1,
+					config: { type: "free_shipping", minimumAmount: money("USD", 1500) },
+				},
+				{
+					id: "pickup",
+					zoneId: "z",
+					type: "local_pickup",
+					title: "Pickup",
+					enabled: true,
+					order: 2,
+					config: { type: "local_pickup", amount: money("USD", 100) },
+				},
+				{
+					id: "weight",
+					zoneId: "z",
+					type: "weight_based",
+					title: "Weight",
+					enabled: true,
+					order: 3,
+					config: { type: "weight_based", currency: "USD", base: money("USD", 50), perGram: 1 },
+				},
+			],
+		});
+		expect(options.map((option) => [option.methodId, option.amount.amount])).toEqual([
+			["flat", 300],
+			["free", 0],
+			["pickup", 100],
+			["weight", 1050],
+		]);
+	});
+
+	it("fails closed for an unsupported class-rate override and a mismatched free threshold", () => {
+		const items = [
+			{
+				lineId: "line",
+				productId: "p",
+				quantity: 1,
+				unitPrice: money("USD", 2000),
+				lineSubtotal: money("USD", 2000),
+				title: "Widget",
+				isDigital: false,
+			},
+		];
+		const options = calculateRates({
+			items,
+			currency: "USD",
+			methods: [
+				{
+					id: "classed",
+					zoneId: "z",
+					type: "flat_rate",
+					title: "Classed",
+					enabled: true,
+					order: 0,
+					config: {
+						type: "flat_rate",
+						amount: money("USD", 100),
+						shippingClassRates: { heavy: money("USD", 500) },
+					},
+				},
+				{
+					id: "wrong-currency-threshold",
+					zoneId: "z",
+					type: "free_shipping",
+					title: "Free",
+					enabled: true,
+					order: 1,
+					config: { type: "free_shipping", minimumAmount: money("EUR", 1) },
+				},
+			],
+		});
+		expect(options).toEqual([]);
 	});
 
 	it("matches common US zip codes to US-wide zone", () => {

@@ -28,14 +28,14 @@ export function resolvePrice(query: PriceQuery): ResolvedPrice | null {
 	const cc = query.currency.toUpperCase();
 
 	if (query.variant) {
-		const entry = query.variant.prices[cc];
+		// Older persisted variants may intentionally inherit product pricing and
+		// therefore have no `prices` map at all. Treat that as no override.
+		const entry = query.variant.prices?.[cc];
 		if (entry) {
 			return {
 				unit: money(cc, entry.amount),
 				compareAt:
-					entry.compareAtAmount !== undefined
-						? money(cc, entry.compareAtAmount)
-						: undefined,
+					entry.compareAtAmount !== undefined ? money(cc, entry.compareAtAmount) : undefined,
 			};
 		}
 		// fall through to product-level pricing
@@ -45,8 +45,7 @@ export function resolvePrice(query: PriceQuery): ResolvedPrice | null {
 	if (!entry) return null;
 	return {
 		unit: money(cc, entry.amount),
-		compareAt:
-			entry.compareAtAmount !== undefined ? money(cc, entry.compareAtAmount) : undefined,
+		compareAt: entry.compareAtAmount !== undefined ? money(cc, entry.compareAtAmount) : undefined,
 	};
 }
 
