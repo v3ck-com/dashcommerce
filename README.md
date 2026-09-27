@@ -4,6 +4,8 @@ A development fork of [emdashCommerce/dashcommerce](https://github.com/emdashCom
 
 **Test-mode software, not a production payment release.** No live Paystack payments, automatic fulfilment, real email, or real-order migration is enabled. This repository contains synthetic fixtures, not an existing shop or its customer data. MIT; upstream attribution and history are retained.
 
+Production readiness is the next implementation target. The current blockers and required acceptance evidence are tracked in [Production readiness](docs/PRODUCTION-READINESS.md); the existing test gates do not constitute production sign-off.
+
 ## Supported development target
 
 - EmDash **exactly 0.41.0**; other versions fail closed.
